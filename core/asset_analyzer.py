@@ -1,6 +1,6 @@
 """
 Анализатор ассетов - сравнивает файлы в папке с используемыми в сценах
-Улучшенная версия с сопоставлением по имени файла
+Сканирует ВСЕ подпапки включая maps, Proxy, textures и т.д.
 """
 
 import os
@@ -8,6 +8,18 @@ from pathlib import Path
 from typing import Dict, List, Set, Optional, Tuple
 from dataclasses import dataclass, field
 from .max_parser import MaxFileParser, SceneAssets
+
+
+@dataclass
+class FileInfo:
+    """Информация о файле"""
+    path: Path
+    name: str
+    extension: str
+    folder: str  # Подпапка (maps, Proxy, и т.д.)
+    file_type: str  # texture, proxy, other
+    is_used: bool = False
+    used_in_scenes: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -27,12 +39,15 @@ class AnalysisResult:
     folder_other: Set[Path] = field(default_factory=set)
     
     # Результаты сравнения
-    unused_files: Set[Path] = field(default_factory=set)  # Файлы в папке, не используемые в сцене
-    missing_files: Set[str] = field(default_factory=set)  # Файлы из сцены, которых нет в папке
-    linked_files: Set[Path] = field(default_factory=set)  # Файлы в папке, используемые в сцене
+    unused_files: Set[Path] = field(default_factory=set)
+    missing_files: Set[str] = field(default_factory=set)
+    linked_files: Set[Path] = field(default_factory=set)
     
-    # Соответствия: файл в папке -> путь в сцене
-    file_mappings: Dict[Path, str] = field(default_factory=dict)
+    # Детальная информация о каждом файле
+    all_files_info: Dict[Path, FileInfo] = field(default_factory=dict)
+    
+    # Статистика по папкам
+    folder_stats: Dict[str, Dict[str, int]] = field(default_factory=dict)
     
     # Ошибки и отладка
     errors: List[str] = field(default_factory=list)
@@ -59,6 +74,20 @@ class AnalysisResult:
             except:
                 pass
         return names
+    
+    def get_files_by_folder(self, folder_name: str) -> List[FileInfo]:
+        """Получить файлы из конкретной подпапки"""
+        return [f for f in self.all_files_info.values() if f.folder.lower() == folder_name.lower()]
+    
+    def get_unused_by_folder(self) -> Dict[str, List[FileInfo]]:
+        """Получить неиспользуемые файлы, сгруппированные по папкам"""
+        result = {}
+        for file_info in self.all_files_info.values():
+            if not file_info.is_used:
+                if file_info.folder not in result:
+                    result[file_info.folder] = []
+                result[file_info.folder].append(file_info)
+        return result
 
 
 class AssetAnalyzer:
@@ -79,13 +108,16 @@ class AssetAnalyzer:
         '.ies', '.hdri', '.mat', '.vismat'
     }
     
+    # Все поддерживаемые расширения
+    ALL_EXTENSIONS = TEXTURE_EXTENSIONS | PROXY_EXTENSIONS | OTHER_EXTENSIONS
+    
     def __init__(self, debug: bool = False):
         self.debug = debug
         self.parser = MaxFileParser(debug=debug)
     
     def analyze_single_scene(self, scene_path: Path, 
                              search_folder: Optional[Path] = None) -> AnalysisResult:
-        """Анализирует одну сцену"""
+        """Анализирует одну сцену и ВСЮ папку проекта"""
         
         if search_folder is None:
             search_folder = scene_path.parent
@@ -106,20 +138,14 @@ class AssetAnalyzer:
         result.used_proxies = scene_assets.proxies.copy()
         result.used_other = scene_assets.other_assets.copy()
         
-        # Сканируем папку
-        self._scan_folder(search_folder, result)
+        # Сканируем ВСЮ папку проекта
+        self._scan_folder_deep(search_folder, result)
         
         # Сравниваем
         self._compare_assets(result)
         
-        # Выводим статистику
-        if self.debug:
-            result.debug_info.append(f"\n=== СТАТИСТИКА СРАВНЕНИЯ ===")
-            result.debug_info.append(f"Ассетов в сцене: {len(result.all_used_assets)}")
-            result.debug_info.append(f"Файлов в папке: {len(result.all_folder_files)}")
-            result.debug_info.append(f"Связанных: {len(result.linked_files)}")
-            result.debug_info.append(f"Неиспользуемых: {len(result.unused_files)}")
-            result.debug_info.append(f"Отсутствующих: {len(result.missing_files)}")
+        # Собираем статистику
+        self._collect_stats(result)
         
         return result
     
@@ -153,60 +179,86 @@ class AssetAnalyzer:
             result.used_proxies.update(scene_assets.proxies)
             result.used_other.update(scene_assets.other_assets)
         
-        # Сканируем папку
-        self._scan_folder(folder_path, result, recursive)
+        # Сканируем ВСЮ папку
+        self._scan_folder_deep(folder_path, result)
         
         # Сравниваем
         self._compare_assets(result)
         
+        # Собираем статистику
+        self._collect_stats(result)
+        
         return result
     
-    def _scan_folder(self, folder_path: Path, result: AnalysisResult, 
-                     recursive: bool = True):
-        """Сканирует папку на наличие ассетов"""
+    def _scan_folder_deep(self, folder_path: Path, result: AnalysisResult):
+        """
+        Глубокое сканирование папки - находит ВСЕ файлы ассетов
+        во всех подпапках
+        """
         
-        all_files = []
+        if self.debug:
+            result.debug_info.append(f"\n🔍 Сканирование папки: {folder_path}")
         
-        if recursive:
-            all_files = list(folder_path.rglob('*'))
-        else:
-            # Сканируем корень
-            all_files = list(folder_path.glob('*'))
-            
-            # И стандартные подпапки
-            for subdir in ['maps', 'textures', 'tex', 'proxy', 'proxies', 
-                          'assets', 'Proxy', 'Maps', 'Textures']:
-                sub_path = folder_path / subdir
-                if sub_path.exists() and sub_path.is_dir():
-                    all_files.extend(sub_path.rglob('*'))
-        
-        for file_path in all_files:
+        # Рекурсивно сканируем все подпапки
+        for file_path in folder_path.rglob('*'):
             if not file_path.is_file():
                 continue
             
-            # Пропускаем файлы в unused
+            # Пропускаем папку unused (если уже есть)
             if 'unused' in file_path.parts:
                 continue
             
             ext = file_path.suffix.lower()
             
+            # Пропускаем неподдерживаемые расширения
+            if ext not in self.ALL_EXTENSIONS:
+                continue
+            
+            # Определяем тип файла
             if ext in self.TEXTURE_EXTENSIONS:
+                file_type = 'texture'
                 result.folder_textures.add(file_path)
             elif ext in self.PROXY_EXTENSIONS:
+                file_type = 'proxy'
                 result.folder_proxies.add(file_path)
-            elif ext in self.OTHER_EXTENSIONS:
+            else:
+                file_type = 'other'
                 result.folder_other.add(file_path)
+            
+            # Определяем подпапку
+            try:
+                rel_path = file_path.relative_to(folder_path)
+                if len(rel_path.parts) > 1:
+                    subfolder = rel_path.parts[0]
+                else:
+                    subfolder = "(корень)"
+            except ValueError:
+                subfolder = "(корень)"
+            
+            # Создаём информацию о файле
+            file_info = FileInfo(
+                path=file_path,
+                name=file_path.name,
+                extension=ext,
+                folder=subfolder,
+                file_type=file_type
+            )
+            
+            result.all_files_info[file_path] = file_info
         
         if self.debug:
-            result.debug_info.append(f"\nСканирование папки: {folder_path}")
-            result.debug_info.append(f"  Текстур найдено: {len(result.folder_textures)}")
-            result.debug_info.append(f"  Прокси найдено: {len(result.folder_proxies)}")
+            result.debug_info.append(f"  Найдено текстур: {len(result.folder_textures)}")
+            result.debug_info.append(f"  Найдено прокси: {len(result.folder_proxies)}")
+            result.debug_info.append(f"  Найдено других: {len(result.folder_other)}")
+            
+            # Показываем найденные подпапки
+            subfolders = set(f.folder for f in result.all_files_info.values())
+            result.debug_info.append(f"  Подпапки: {subfolders}")
     
     def _compare_assets(self, result: AnalysisResult):
         """Сравнивает используемые ассеты с файлами в папке"""
         
         # Создаём индекс имён файлов из сцены
-        # имя файла (lower) -> список полных путей из сцены
         scene_names_index: Dict[str, List[str]] = {}
         
         for asset_path in result.all_used_assets:
@@ -219,57 +271,68 @@ class AssetAnalyzer:
                 continue
         
         if self.debug:
-            result.debug_info.append(f"\nИндекс имён из сцены: {len(scene_names_index)} уникальных имён")
-            for name in list(scene_names_index.keys())[:5]:
-                result.debug_info.append(f"  {name}")
+            result.debug_info.append(f"\n📋 Имён в сцене: {len(scene_names_index)}")
         
         # Проверяем каждый файл в папке
-        matched_scene_assets: Set[str] = set()  # Какие ассеты из сцены нашли
-        
-        for file_path in result.all_folder_files:
+        for file_path, file_info in result.all_files_info.items():
             file_name = file_path.name.lower()
             
             # Ищем по имени файла
             if file_name in scene_names_index:
                 result.linked_files.add(file_path)
-                result.file_mappings[file_path] = scene_names_index[file_name][0]
-                matched_scene_assets.update(scene_names_index[file_name])
+                file_info.is_used = True
+                file_info.used_in_scenes = scene_names_index[file_name]
                 
                 if self.debug:
-                    result.debug_info.append(f"  ✓ Связан: {file_name}")
+                    result.debug_info.append(f"  ✓ {file_info.folder}/{file_name}")
             else:
                 result.unused_files.add(file_path)
+                file_info.is_used = False
                 
                 if self.debug:
-                    result.debug_info.append(f"  ✗ Не используется: {file_name}")
+                    result.debug_info.append(f"  ✗ {file_info.folder}/{file_name}")
         
         # Определяем отсутствующие файлы
-        # (те, что есть в сцене, но не найдены в папке)
         folder_names = {f.name.lower() for f in result.all_folder_files}
         
         for asset_path in result.all_used_assets:
             try:
                 asset_name = Path(asset_path).name.lower()
                 
-                # Если файл не найден в папке по имени
                 if asset_name not in folder_names:
-                    # Проверяем, существует ли он по оригинальному пути
                     if not Path(asset_path).exists():
                         result.missing_files.add(asset_path)
                         
             except Exception:
                 result.missing_files.add(asset_path)
     
-    @staticmethod
-    def _normalize_path(path_str: str) -> str:
-        """Нормализует путь для сравнения"""
-        try:
-            normalized = path_str.lower().replace('/', '\\')
-            if normalized.startswith('\\\\'):
-                prefix = '\\\\'
-                normalized = prefix + normalized[2:].replace('\\\\', '\\')
+    def _collect_stats(self, result: AnalysisResult):
+        """Собирает статистику по папкам"""
+        
+        for file_info in result.all_files_info.values():
+            folder = file_info.folder
+            
+            if folder not in result.folder_stats:
+                result.folder_stats[folder] = {
+                    'total': 0,
+                    'used': 0,
+                    'unused': 0,
+                    'textures': 0,
+                    'proxies': 0,
+                    'other': 0
+                }
+            
+            stats = result.folder_stats[folder]
+            stats['total'] += 1
+            
+            if file_info.is_used:
+                stats['used'] += 1
             else:
-                normalized = normalized.replace('\\\\', '\\')
-            return normalized
-        except Exception:
-            return path_str.lower()
+                stats['unused'] += 1
+            
+            if file_info.file_type == 'texture':
+                stats['textures'] += 1
+            elif file_info.file_type == 'proxy':
+                stats['proxies'] += 1
+            else:
+                stats['other'] += 1

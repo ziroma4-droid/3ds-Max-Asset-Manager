@@ -6,8 +6,6 @@ import sys
 import os
 from pathlib import Path
 from typing import Optional
-import subprocess
-import tempfile
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -22,6 +20,7 @@ from PyQt6.QtGui import QFont, QTextCursor
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core import AssetAnalyzer, FileManager, AnalysisResult, OrganizeResult
+from core.asset_analyzer import FileInfo
 
 
 class AnalyzerThread(QThread):
@@ -32,14 +31,11 @@ class AnalyzerThread(QThread):
     error = pyqtSignal(str)
     
     def __init__(self, path: Path, is_folder: bool = False, 
-                 recursive: bool = False, use_maxscript: bool = False,
-                 max_path: str = ""):
+                 recursive: bool = False):
         super().__init__()
         self.path = path
         self.is_folder = is_folder
         self.recursive = recursive
-        self.use_maxscript = use_maxscript
-        self.max_path = max_path
         self.analyzer = AssetAnalyzer(debug=True)
     
     def run(self):
@@ -66,43 +62,52 @@ class OrganizerThread(QThread):
     finished_organizing = pyqtSignal(object)
     error = pyqtSignal(str)
     
-    def __init__(self, analysis: AnalysisResult, 
+    def __init__(self, analysis, 
                  create_maps: bool = True,
                  move_unused: bool = True,
-                 copy_mode: bool = False):
+                 copy_mode: bool = False,
+                 delete_duplicates: bool = True):
         super().__init__()
         self.analysis = analysis
         self.create_maps = create_maps
         self.move_unused = move_unused
         self.copy_mode = copy_mode
+        self.delete_duplicates = delete_duplicates
     
     def run(self):
+        result = None
         try:
-            manager = FileManager(progress_callback=self._emit_progress)
+            from core.file_manager import FileManager, OrganizeResult
             
-            self._emit_progress("📦 Начинаем организацию файлов...")
+            def safe_progress(msg):
+                try:
+                    self.progress.emit(str(msg))
+                except:
+                    pass
+            
+            manager = FileManager(progress_callback=safe_progress)
             
             result = manager.organize_assets(
                 self.analysis,
                 create_maps_folder=self.create_maps,
                 move_unused=self.move_unused,
-                copy_instead_of_move=self.copy_mode
+                copy_instead_of_move=self.copy_mode,
+                delete_duplicates=self.delete_duplicates
             )
-            
-            self._emit_progress("✅ Организация завершена")
-            self.finished_organizing.emit(result)
             
         except Exception as e:
             import traceback
-            error_msg = f"Ошибка организации: {str(e)}\n{traceback.format_exc()}"
+            error_msg = f"Ошибка: {str(e)}\n{traceback.format_exc()}"
             self.error.emit(error_msg)
-    
-    def _emit_progress(self, msg: str):
-        """Безопасная отправка прогресса"""
-        try:
-            self.progress.emit(msg)
-        except Exception:
-            pass
+            from core.file_manager import OrganizeResult
+            result = OrganizeResult()
+        
+        finally:
+            if result is None:
+                from core.file_manager import OrganizeResult
+                result = OrganizeResult()
+            self.finished_organizing.emit(result)
+
 
 
 class MainWindow(QMainWindow):
@@ -113,6 +118,8 @@ class MainWindow(QMainWindow):
         
         self.settings = QSettings("MaxAssetManager", "Settings")
         self.current_analysis: Optional[AnalysisResult] = None
+        self.analyzer_thread = None
+        self.organizer_thread = None
         
         self.init_ui()
         self.load_settings()
@@ -123,7 +130,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("3ds Max Asset Manager")
         self.setMinimumSize(900, 700)
         
-        # Центральный виджет
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
@@ -146,40 +152,42 @@ class MainWindow(QMainWindow):
         
         main_layout.addWidget(max_group)
         
-        # === Табы для режимов работы ===
+        # === Табы ===
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
         
-        # Таб одной сцены
         single_tab = self.create_single_scene_tab()
         self.tabs.addTab(single_tab, "📄 Одна сцена")
         
-        # Таб папки
         folder_tab = self.create_folder_tab()
         self.tabs.addTab(folder_tab, "📁 Папка со сценами")
         
-        # === Опции ===
-        options_group = QGroupBox("Опции")
+                # === Опции ===
+        options_group = QGroupBox("Опции организации")
         options_layout = QHBoxLayout(options_group)
         
         self.copy_mode_cb = QCheckBox("Копировать (не перемещать)")
-        self.copy_mode_cb.setToolTip("Копировать файлы вместо перемещения")
         options_layout.addWidget(self.copy_mode_cb)
         
-        self.create_maps_cb = QCheckBox("Связанные → maps")
-        self.create_maps_cb.setChecked(True)
-        self.create_maps_cb.setToolTip("Перемещать связанные файлы в папку maps")
+        self.create_maps_cb = QCheckBox("Собрать в maps")
+        self.create_maps_cb.setChecked(True)  # Теперь по умолчанию включено
+        self.create_maps_cb.setToolTip("Собрать все связанные файлы в папку maps")
         options_layout.addWidget(self.create_maps_cb)
         
-        self.move_unused_cb = QCheckBox("Неиспользуемые → unused")
+        self.delete_duplicates_cb = QCheckBox("Удалять дубликаты")
+        self.delete_duplicates_cb.setChecked(True)
+        self.delete_duplicates_cb.setToolTip("Удалять файлы-дубликаты (одинаковое содержимое)")
+        options_layout.addWidget(self.delete_duplicates_cb)
+        
+        self.move_unused_cb = QCheckBox("Unused → папка")
         self.move_unused_cb.setChecked(True)
-        self.move_unused_cb.setToolTip("Перемещать неиспользуемые файлы в папку unused")
         options_layout.addWidget(self.move_unused_cb)
         
         options_layout.addStretch()
         main_layout.addWidget(options_group)
+
         
-        # === Кнопки действий ===
+        # === Кнопки ===
         actions_layout = QHBoxLayout()
         
         self.analyze_btn = QPushButton("🔍 Анализировать")
@@ -216,25 +224,19 @@ class MainWindow(QMainWindow):
         self.log_text.setMinimumHeight(250)
         log_layout.addWidget(self.log_text)
         
-        # Кнопки журнала
         log_buttons = QHBoxLayout()
-        
         clear_log_btn = QPushButton("Очистить журнал")
         clear_log_btn.clicked.connect(self.log_text.clear)
         log_buttons.addWidget(clear_log_btn)
-        
         log_buttons.addStretch()
         log_layout.addLayout(log_buttons)
         
         main_layout.addWidget(log_group)
     
     def create_single_scene_tab(self) -> QWidget:
-        """Создает таб для работы с одной сценой"""
-        
         tab = QWidget()
         layout = QVBoxLayout(tab)
         
-        # Выбор сцены
         scene_layout = QHBoxLayout()
         scene_layout.addWidget(QLabel("Файл сцены:"))
         
@@ -248,7 +250,6 @@ class MainWindow(QMainWindow):
         
         layout.addLayout(scene_layout)
         
-        # Информация о сцене
         info_frame = QFrame()
         info_frame.setFrameStyle(QFrame.Shape.StyledPanel)
         info_layout = QVBoxLayout(info_frame)
@@ -263,12 +264,9 @@ class MainWindow(QMainWindow):
         return tab
     
     def create_folder_tab(self) -> QWidget:
-        """Создает таб для работы с папкой"""
-        
         tab = QWidget()
         layout = QVBoxLayout(tab)
         
-        # Выбор папки
         folder_layout = QHBoxLayout()
         folder_layout.addWidget(QLabel("Папка проекта:"))
         
@@ -282,11 +280,9 @@ class MainWindow(QMainWindow):
         
         layout.addLayout(folder_layout)
         
-        # Опция рекурсивного поиска
         self.recursive_cb = QCheckBox("Искать сцены в подпапках")
         layout.addWidget(self.recursive_cb)
         
-        # Список найденных сцен
         scenes_group = QGroupBox("Найденные сцены")
         scenes_layout = QVBoxLayout(scenes_group)
         
@@ -298,22 +294,16 @@ class MainWindow(QMainWindow):
         return tab
     
     def browse_max_path(self):
-        """Выбор пути к 3dsmax.exe"""
         file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Выберите 3dsmax.exe",
-            "",
-            "3ds Max (3dsmax.exe)"
+            self, "Выберите 3dsmax.exe", "", "3ds Max (3dsmax.exe)"
         )
         if file_path:
             self.max_path_edit.setText(file_path)
             self.settings.setValue("max_path", file_path)
     
     def browse_scene(self):
-        """Выбор .max файла"""
         file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Выберите сцену 3ds Max",
+            self, "Выберите сцену 3ds Max",
             self.settings.value("last_scene_dir", ""),
             "3ds Max Scene (*.max)"
         )
@@ -323,10 +313,8 @@ class MainWindow(QMainWindow):
             self.scene_info_label.setText(f"Выбрана сцена: {Path(file_path).name}")
     
     def browse_folder(self):
-        """Выбор папки со сценами"""
         folder_path = QFileDialog.getExistingDirectory(
-            self,
-            "Выберите папку со сценами",
+            self, "Выберите папку со сценами",
             self.settings.value("last_folder", "")
         )
         if folder_path:
@@ -335,7 +323,6 @@ class MainWindow(QMainWindow):
             self.scan_folder_for_scenes(Path(folder_path))
     
     def scan_folder_for_scenes(self, folder: Path):
-        """Сканирует папку на наличие .max файлов"""
         self.scenes_list.clear()
         
         if self.recursive_cb.isChecked():
@@ -348,52 +335,41 @@ class MainWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, str(f))
             self.scenes_list.addItem(item)
         
-        self.log(f"📁 Найдено сцен в папке: {len(max_files)}")
+        self.log(f"📁 Найдено сцен: {len(max_files)}")
     
     def start_analysis(self):
-        """Запускает анализ"""
-        # Определяем режим работы
         current_tab = self.tabs.currentIndex()
         
-        if current_tab == 0:  # Одна сцена
+        if current_tab == 0:
             path = self.scene_path_edit.text().strip()
             if not path:
-                QMessageBox.warning(self, "Ошибка", "Выберите сцену для анализа")
+                QMessageBox.warning(self, "Ошибка", "Выберите сцену")
                 return
-            
             path = Path(path)
             if not path.exists():
                 QMessageBox.warning(self, "Ошибка", "Файл не найден")
                 return
-            
             is_folder = False
             recursive = False
-            
-        else:  # Папка
+        else:
             path = self.folder_path_edit.text().strip()
             if not path:
-                QMessageBox.warning(self, "Ошибка", "Выберите папку для анализа")
+                QMessageBox.warning(self, "Ошибка", "Выберите папку")
                 return
-            
             path = Path(path)
             if not path.exists():
                 QMessageBox.warning(self, "Ошибка", "Папка не найдена")
                 return
-            
             is_folder = True
             recursive = self.recursive_cb.isChecked()
         
-        # Настраиваем UI
         self.set_ui_busy(True)
         self.log_text.clear()
         
-        # Запускаем анализ в отдельном потоке
         self.analyzer_thread = AnalyzerThread(
             path=path,
             is_folder=is_folder,
-            recursive=recursive,
-            use_maxscript=False,
-            max_path=self.max_path_edit.text().strip()
+            recursive=recursive
         )
         
         self.analyzer_thread.progress.connect(self.log)
@@ -409,63 +385,49 @@ class MainWindow(QMainWindow):
         self.organize_btn.setEnabled(True)
         self.save_report_btn.setEnabled(True)
         
-        # Выводим результаты в журнал
-        self.log("\n" + "=" * 50)
+        self.log("\n" + "=" * 60)
         self.log("📊 РЕЗУЛЬТАТЫ АНАЛИЗА")
-        self.log("=" * 50)
+        self.log("=" * 60)
         
-        self.log(f"\n📄 Сцен проанализировано: {len(result.scenes)}")
+        self.log(f"\n📄 Сцен: {len(result.scenes)}")
         for scene in result.scenes:
             self.log(f"   • {scene.name}")
         
-        # Статистика из сцены
-        self.log(f"\n📦 Ассеты В СЦЕНЕ:")
+        self.log(f"\n📦 АССЕТЫ В СЦЕНЕ:")
         self.log(f"   🎨 Текстур: {len(result.used_textures)}")
         self.log(f"   📦 Прокси: {len(result.used_proxies)}")
         self.log(f"   📎 Других: {len(result.used_other)}")
         
-        # Показываем примеры путей из сцены
-        if result.used_textures:
-            self.log(f"\n   Примеры текстур из сцены:")
-            for tex in list(result.used_textures)[:3]:
-                self.log(f"      {tex}")
+        # Статистика по папкам
+        self.log(f"\n" + "-" * 60)
+        self.log(f"📂 ФАЙЛЫ В ПАПКЕ ({result.folder_path}):")
+        self.log("-" * 60)
         
-        # Статистика из папки
-        self.log(f"\n📂 Файлы В ПАПКЕ ({result.folder_path}):")
-        self.log(f"   🎨 Текстур: {len(result.folder_textures)}")
-        self.log(f"   📦 Прокси: {len(result.folder_proxies)}")
-        self.log(f"   📎 Других: {len(result.folder_other)}")
+        if result.folder_stats:
+            for folder_name, stats in sorted(result.folder_stats.items()):
+                used_pct = (stats['used'] / stats['total'] * 100) if stats['total'] > 0 else 0
+                self.log(f"\n📁 {folder_name}/")
+                self.log(f"   Всего: {stats['total']} | ✅ Используется: {stats['used']} ({used_pct:.0f}%) | ⚠️ Не используется: {stats['unused']}")
         
-        # Результаты сравнения
-        self.log(f"\n" + "-" * 50)
-        self.log(f"📋 РЕЗУЛЬТАТЫ СРАВНЕНИЯ (по имени файла):")
-        self.log(f"-" * 50)
+        # Итоги
+        self.log(f"\n" + "=" * 60)
+        self.log(f"📋 ИТОГО:")
+        self.log(f"   ✅ Связано: {len(result.linked_files)}")
+        self.log(f"   ⚠️ Не используется: {len(result.unused_files)}")
+        self.log(f"   ❌ Отсутствует: {len(result.missing_files)}")
         
-        self.log(f"\n✅ Связанные файлы (есть в сцене и в папке): {len(result.linked_files)}")
-        for f in sorted(result.linked_files, key=lambda x: x.name)[:15]:
-            self.log(f"   ✓ {f.name}")
-        if len(result.linked_files) > 15:
-            self.log(f"   ... и ещё {len(result.linked_files) - 15}")
+        # Неиспользуемые по папкам
+        if result.unused_files:
+            self.log(f"\n⚠️ НЕИСПОЛЬЗУЕМЫЕ ФАЙЛЫ:")
+            unused_by_folder = result.get_unused_by_folder()
+            for folder_name, files in sorted(unused_by_folder.items()):
+                self.log(f"\n   📁 {folder_name}/ ({len(files)}):")
+                for fi in sorted(files, key=lambda x: x.name)[:10]:
+                    self.log(f"      ⚠ {fi.name}")
+                if len(files) > 10:
+                    self.log(f"      ... и ещё {len(files) - 10}")
         
-        self.log(f"\n⚠️ Неиспользуемые файлы (есть в папке, нет в сцене): {len(result.unused_files)}")
-        for f in sorted(result.unused_files, key=lambda x: x.name)[:15]:
-            self.log(f"   ⚠ {f.name}")
-        if len(result.unused_files) > 15:
-            self.log(f"   ... и ещё {len(result.unused_files) - 15}")
-        
-        if result.missing_files:
-            self.log(f"\n❌ Отсутствующие файлы (есть в сцене, нет в папке): {len(result.missing_files)}")
-            for f in sorted(result.missing_files)[:10]:
-                self.log(f"   ✗ {Path(f).name}")
-            if len(result.missing_files) > 10:
-                self.log(f"   ... и ещё {len(result.missing_files) - 10}")
-        
-        if result.errors:
-            self.log(f"\n⚠️ Предупреждения:")
-            for e in result.errors[:5]:
-                self.log(f"   {e}")
-        
-        self.log("\n" + "=" * 50)
+        self.log("\n" + "=" * 60)
     
     def start_organizing(self):
         """Запускает организацию файлов"""
@@ -480,26 +442,21 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Информация", "Нет файлов для организации")
             return
         
-        # Подтверждение
         msg = f"Будет выполнено:\n\n"
-        
         if self.create_maps_cb.isChecked():
-            msg += f"• Связанных файлов → maps: {linked_count}\n"
-        
+            msg += f"• Собрать связанные файлы в maps: {linked_count}\n"
+            if self.delete_duplicates_cb.isChecked():
+                msg += f"• Удалить дубликаты: Да\n"
         if self.move_unused_cb.isChecked():
-            msg += f"• Неиспользуемых файлов → unused: {unused_count}\n"
+            msg += f"• Переместить неиспользуемые в unused: {unused_count}\n"
         
         if self.copy_mode_cb.isChecked():
-            msg += "\n⚠️ Режим копирования (оригиналы останутся)"
+            msg += "\n⚠️ Режим: КОПИРОВАНИЕ"
         else:
-            msg += "\n⚠️ Режим перемещения (оригиналы будут перенесены)"
-        
-        msg += f"\n\nПапка: {self.current_analysis.folder_path}"
+            msg += "\n⚠️ Режим: ПЕРЕМЕЩЕНИЕ"
         
         reply = QMessageBox.question(
-            self, 
-            "Подтверждение",
-            msg,
+            self, "Подтверждение", msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         
@@ -507,15 +464,16 @@ class MainWindow(QMainWindow):
             return
         
         self.set_ui_busy(True)
-        self.log("\n" + "=" * 50)
+        self.log("\n" + "=" * 60)
         self.log("📦 ОРГАНИЗАЦИЯ ФАЙЛОВ")
-        self.log("=" * 50)
+        self.log("=" * 60)
         
         self.organizer_thread = OrganizerThread(
             analysis=self.current_analysis,
             create_maps=self.create_maps_cb.isChecked(),
             move_unused=self.move_unused_cb.isChecked(),
-            copy_mode=self.copy_mode_cb.isChecked()
+            copy_mode=self.copy_mode_cb.isChecked(),
+            delete_duplicates=self.delete_duplicates_cb.isChecked()
         )
         
         self.organizer_thread.progress.connect(self.log)
@@ -524,48 +482,44 @@ class MainWindow(QMainWindow):
         self.organizer_thread.finished.connect(lambda: self.set_ui_busy(False))
         
         self.organizer_thread.start()
+
     
     def on_organizing_finished(self, result):
         """Обработка завершения организации"""
         if result is None:
-            self.log("\n❌ Ошибка: результат организации пустой")
+            self.log("\n❌ Результат пустой")
             return
         
-        self.log("\n" + "-" * 50)
-        self.log("📊 ИТОГИ:")
+        self.log("\n" + "-" * 60)
+        self.log("📊 ИТОГИ ОРГАНИЗАЦИИ:")
         self.log(f"   ✅ Успешно: {len(result.successful_moves)}")
         self.log(f"   ❌ Ошибок: {len(result.failed_moves)}")
         
         if result.maps_folder:
-            self.log(f"   📁 Папка maps: {result.maps_folder}")
+            self.log(f"   📁 maps: {result.maps_folder}")
         if result.unused_folder:
-            self.log(f"   📁 Папка unused: {result.unused_folder}")
+            self.log(f"   📁 unused: {result.unused_folder}")
         
         if result.failed_moves:
-            self.log("\n❌ Файлы с ошибками:")
+            self.log("\n❌ Ошибки:")
             for op in result.failed_moves[:10]:
                 self.log(f"   • {op.source.name}: {op.error}")
         
-        self.log("=" * 50)
+        self.log("=" * 60)
         
         QMessageBox.information(
-            self,
-            "Готово",
-            f"Организация файлов завершена!\n\n"
-            f"Успешно: {len(result.successful_moves)}\n"
-            f"Ошибок: {len(result.failed_moves)}"
+            self, "Готово",
+            f"Организация завершена!\n\nУспешно: {len(result.successful_moves)}\nОшибок: {len(result.failed_moves)}"
         )
     
     def save_report(self):
-        """Сохраняет отчет в файл"""
         if not self.current_analysis:
             return
         
         file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Сохранить отчет",
+            self, "Сохранить отчет",
             str(self.current_analysis.folder_path / "asset_report.txt"),
-            "Text Files (*.txt);;All Files (*)"
+            "Text Files (*.txt)"
         )
         
         if file_path:
@@ -577,27 +531,16 @@ class MainWindow(QMainWindow):
                     f.write(report)
                 
                 self.log(f"\n💾 Отчет сохранен: {file_path}")
-                
-                QMessageBox.information(
-                    self,
-                    "Сохранено",
-                    f"Отчет сохранен:\n{file_path}"
-                )
+                QMessageBox.information(self, "Сохранено", f"Отчет сохранен:\n{file_path}")
                 
             except Exception as e:
-                QMessageBox.critical(
-                    self,
-                    "Ошибка",
-                    f"Не удалось сохранить отчет:\n{str(e)}"
-                )
+                QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить:\n{e}")
     
     def on_error(self, error_msg: str):
-        """Обработка ошибок"""
         self.log(f"\n❌ ОШИБКА: {error_msg}")
         QMessageBox.critical(self, "Ошибка", error_msg)
     
     def set_ui_busy(self, busy: bool):
-        """Переключает UI в режим занятости"""
         self.analyze_btn.setEnabled(not busy)
         self.organize_btn.setEnabled(not busy and self.current_analysis is not None)
         self.save_report_btn.setEnabled(not busy and self.current_analysis is not None)
@@ -610,121 +553,49 @@ class MainWindow(QMainWindow):
             self.progress_bar.setRange(0, 100)
     
     def log(self, message: str):
-        """Добавляет сообщение в журнал"""
         self.log_text.append(message)
-        
         cursor = self.log_text.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.log_text.setTextCursor(cursor)
-        
         QApplication.processEvents()
     
     def load_settings(self):
-        """Загружает настройки"""
         max_path = self.settings.value("max_path", "")
         if max_path:
             self.max_path_edit.setText(max_path)
-        
-        if not max_path:
+        else:
             self.auto_detect_max()
     
     def auto_detect_max(self):
-        """Автоматическое определение пути к 3ds Max"""
-        possible_paths = [
-            r"C:\Program Files\Autodesk\3ds Max 2025\3dsmax.exe",
-            r"C:\Program Files\Autodesk\3ds Max 2024\3dsmax.exe",
-            r"C:\Program Files\Autodesk\3ds Max 2023\3dsmax.exe",
-            r"C:\Program Files\Autodesk\3ds Max 2022\3dsmax.exe",
-            r"C:\Program Files\Autodesk\3ds Max 2021\3dsmax.exe",
-        ]
-        
-        for path in possible_paths:
+        for year in range(2025, 2019, -1):
+            path = f"C:\\Program Files\\Autodesk\\3ds Max {year}\\3dsmax.exe"
             if Path(path).exists():
                 self.max_path_edit.setText(path)
                 self.settings.setValue("max_path", path)
-                self.log(f"🔍 Найден 3ds Max: {path}")
                 break
     
     def closeEvent(self, event):
-        """Сохраняем настройки при закрытии"""
         self.settings.setValue("max_path", self.max_path_edit.text())
-        self.settings.setValue("geometry", self.saveGeometry())
         event.accept()
 
 
 def main():
-    """Точка входа"""
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     
-    # Стиль
     app.setStyleSheet("""
-        QMainWindow { background-color: #2b2b2b; }
-        QGroupBox {
-            font-weight: bold;
-            border: 1px solid #555;
-            border-radius: 5px;
-            margin-top: 10px;
-            padding-top: 10px;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            left: 10px;
-            padding: 0 5px;
-        }
-        QPushButton {
-            background-color: #0d6efd;
-            color: white;
-            border: none;
-            padding: 8px 16px;
-            border-radius: 4px;
-            font-weight: bold;
-        }
+        QGroupBox { font-weight: bold; border: 1px solid #555; border-radius: 5px; margin-top: 10px; padding-top: 10px; }
+        QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+        QPushButton { background-color: #0d6efd; color: white; border: none; padding: 8px 16px; border-radius: 4px; font-weight: bold; }
         QPushButton:hover { background-color: #0b5ed7; }
-        QPushButton:pressed { background-color: #0a58ca; }
         QPushButton:disabled { background-color: #6c757d; }
-        QTextEdit {
-            background-color: #1e1e1e;
-            color: #d4d4d4;
-            border: 1px solid #555;
-            border-radius: 4px;
-        }
-        QLineEdit {
-            padding: 6px;
-            border: 1px solid #555;
-            border-radius: 4px;
-            background-color: #3c3c3c;
-            color: white;
-        }
-        QListWidget {
-            background-color: #1e1e1e;
-            color: #d4d4d4;
-            border: 1px solid #555;
-            border-radius: 4px;
-        }
-        QCheckBox { spacing: 8px; }
-        QTabWidget::pane {
-            border: 1px solid #555;
-            border-radius: 4px;
-        }
-        QTabBar::tab {
-            background-color: #3c3c3c;
-            color: white;
-            padding: 8px 16px;
-            margin-right: 2px;
-            border-top-left-radius: 4px;
-            border-top-right-radius: 4px;
-        }
+        QTextEdit { background-color: #1e1e1e; color: #d4d4d4; border: 1px solid #555; border-radius: 4px; }
+        QLineEdit { padding: 6px; border: 1px solid #555; border-radius: 4px; background-color: #3c3c3c; color: white; }
+        QListWidget { background-color: #1e1e1e; color: #d4d4d4; border: 1px solid #555; }
+        QTabBar::tab { background-color: #3c3c3c; color: white; padding: 8px 16px; }
         QTabBar::tab:selected { background-color: #0d6efd; }
-        QProgressBar {
-            border: 1px solid #555;
-            border-radius: 4px;
-            text-align: center;
-        }
-        QProgressBar::chunk {
-            background-color: #0d6efd;
-            border-radius: 3px;
-        }
+        QProgressBar { border: 1px solid #555; border-radius: 4px; }
+        QProgressBar::chunk { background-color: #0d6efd; }
     """)
     
     window = MainWindow()

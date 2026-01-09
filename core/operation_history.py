@@ -129,40 +129,73 @@ class OperationHistory:
         self.operations = []
         self._save_history()
     
-    def get_folders_with_operations(self) -> Dict[Path, Dict]:
+    def get_folders_with_operations(self) -> List[Dict]:
         """
-        Возвращает словарь корневых папок с информацией об операциях
+        Возвращает список всех операций организации (каждая операция - отдельная запись)
+        Группирует операции по backup_id (каждая операция организации - отдельная запись)
         
         Returns:
-            {base_folder: {'backup_id': str, 'timestamp': str, 'operations_count': int, 'operations': list}}
+            Список словарей: [{'base_folder': Path, 'backup_id': str, 'timestamp': str, 'operations_count': int, 'operations': list}, ...]
         """
-        folders = {}
+        # Группируем операции по backup_id (каждая операция организации - отдельная запись)
+        backup_groups = {}
         
         for op in self.operations:
             if not op.success or not op.backup_id or not op.base_folder:
                 continue
             
-            base_folder = Path(op.base_folder)
+            backup_id = op.backup_id
             
-            if base_folder not in folders:
-                folders[base_folder] = {
-                    'backup_id': op.backup_id,
+            if backup_id not in backup_groups:
+                backup_groups[backup_id] = {
+                    'base_folder': Path(op.base_folder),
+                    'backup_id': backup_id,
                     'timestamp': op.timestamp,
                     'operations_count': 0,
                     'operations': []
                 }
             
-            folders[base_folder]['operations_count'] += 1
-            folders[base_folder]['operations'].append(op)
+            backup_groups[backup_id]['operations_count'] += 1
+            backup_groups[backup_id]['operations'].append(op)
             
             # Обновляем timestamp на самый поздний
-            if op.timestamp > folders[base_folder]['timestamp']:
-                folders[base_folder]['timestamp'] = op.timestamp
+            if op.timestamp > backup_groups[backup_id]['timestamp']:
+                backup_groups[backup_id]['timestamp'] = op.timestamp
         
-        return folders
+        # Возвращаем список всех операций
+        return list(backup_groups.values())
+    
+    def get_operations_by_backup_id(self, backup_id: str) -> List[Operation]:
+        """Возвращает все операции для указанного backup_id"""
+        return [op for op in self.operations 
+                if op.backup_id == backup_id and op.success]
     
     def get_operations_by_folder(self, base_folder: Path) -> List[Operation]:
         """Возвращает все операции для указанной корневой папки"""
         return [op for op in self.operations 
                 if op.base_folder == base_folder and op.success and op.backup_id]
+    
+    def delete_operations_by_folder(self, base_folder: Path) -> int:
+        """
+        Удаляет все операции для указанной корневой папки
+        
+        Args:
+            base_folder: Корневая папка проекта
+            
+        Returns:
+            Количество удаленных операций
+        """
+        base_folder = Path(base_folder)
+        initial_count = len(self.operations)
+        
+        # Удаляем все операции для этой папки
+        self.operations = [op for op in self.operations 
+                          if not (op.base_folder == base_folder and op.success and op.backup_id)]
+        
+        deleted_count = initial_count - len(self.operations)
+        
+        if deleted_count > 0:
+            self._save_history()
+        
+        return deleted_count
 

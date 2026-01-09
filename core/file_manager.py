@@ -51,6 +51,10 @@ class OrganizeResult:
 class FileManager:
     """Менеджер для организации файлов ассетов"""
     
+    # Расширения файлов-изображений для проверки целостности
+    TEXTURE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.tga', '.tif', '.tiff', 
+                          '.bmp', '.gif', '.exr', '.hdr', '.psd', '.dds', '.tx', '.tex'}
+    
     def __init__(self, progress_callback: Optional[Callable[[str], None]] = None,
                  enable_backup: bool = False,
                  check_integrity: bool = True):
@@ -124,10 +128,19 @@ class FileManager:
                 result.maps_folder = maps_folder
                 self._log(f"📁 Папка maps: {maps_folder}")
             
-            if move_unused:
+            # Проверяем, есть ли неиспользуемые файлы перед созданием папки
+            unused_files_count = 0
+            if move_unused and hasattr(analysis, 'unused_files'):
+                unused_files_count = len([f for f in analysis.unused_files 
+                                         if Path(f).exists() and Path(f).suffix.lower() != '.max'])
+            
+            if move_unused and unused_files_count > 0:
                 unused_folder.mkdir(exist_ok=True)
                 result.unused_folder = unused_folder
                 self._log(f"📁 Папка unused: {unused_folder}")
+            else:
+                # Не создаем папку, если нет неиспользуемых файлов
+                result.unused_folder = None
             
             # === ШАГ 1: Собираем связанные файлы в maps ===
             if create_maps_folder and hasattr(analysis, 'linked_files'):
@@ -164,21 +177,28 @@ class FileManager:
                             result.files_skipped += 1
                             continue
                         
-                        # Проверка целостности
+                        # Проверка целостности только для изображений (текстур)
                         if self.check_integrity:
-                            is_valid, error = FileIntegrityChecker.check_image_integrity(file_path)
-                            if not is_valid:
-                                result.integrity_errors.append({
-                                    'file': str(file_path),
-                                    'error': error
-                                })
-                                self._log(f"   ⚠️ Поврежден: {file_name} - {error}")
+                            # Проверяем только файлы-изображения
+                            if file_path.suffix.lower() in self.TEXTURE_EXTENSIONS:
+                                is_valid, error = FileIntegrityChecker.check_image_integrity(file_path)
+                                if not is_valid:
+                                    result.integrity_errors.append({
+                                        'file': str(file_path),
+                                        'error': error
+                                    })
+                                    self._log(f"   ⚠️ Поврежден: {file_name} - {error}")
                         
                         # Резервное копирование
                         if self.enable_backup and backup_id:
                             self.backup_manager.create_backup(file_path, backup_id)
                         
-                        op = self._move_file(file_path, maps_folder, copy_instead_of_move, backup_id)
+                        # Определяем, копировать или перемещать: если файл вне папки сцены - копировать
+                        should_copy = not self._is_file_in_scene_folder(file_path, analysis)
+                        if should_copy:
+                            self._log(f"   📋 Файл вне папки сцены, будет скопирован: {file_name}")
+                        
+                        op = self._move_file(file_path, maps_folder, should_copy, backup_id)
                         result.operations.append(op)
                         if op.success:
                             result.files_moved += 1
@@ -214,26 +234,35 @@ class FileManager:
                                     self._log(f"      ⚠ Разный контент: {other_file.parent.name}/{other_file.name}")
                                     if self.enable_backup and backup_id:
                                         self.backup_manager.create_backup(other_file, backup_id)
-                                    op = self._move_file(other_file, maps_folder, copy_instead_of_move, backup_id, rename=True)
+                                    # Определяем, копировать или перемещать
+                                    should_copy = not self._is_file_in_scene_folder(other_file, analysis)
+                                    op = self._move_file(other_file, maps_folder, should_copy, backup_id, rename=True)
                                     result.operations.append(op)
                         else:
                             master_file = others[0]
                             master_hash = self._get_file_hash(master_file)
                             
                             # Проверка целостности и резервное копирование для master_file
+                            # Проверяем только файлы-изображения
                             if self.check_integrity:
-                                is_valid, error = FileIntegrityChecker.check_image_integrity(master_file)
-                                if not is_valid:
-                                    result.integrity_errors.append({
-                                        'file': str(master_file),
-                                        'error': error
-                                    })
-                                    self._log(f"   ⚠️ Поврежден: {master_file.name} - {error}")
+                                if master_file.suffix.lower() in self.TEXTURE_EXTENSIONS:
+                                    is_valid, error = FileIntegrityChecker.check_image_integrity(master_file)
+                                    if not is_valid:
+                                        result.integrity_errors.append({
+                                            'file': str(master_file),
+                                            'error': error
+                                        })
+                                        self._log(f"   ⚠️ Поврежден: {master_file.name} - {error}")
                             
                             if self.enable_backup and backup_id:
                                 self.backup_manager.create_backup(master_file, backup_id)
                             
-                            op = self._move_file(master_file, maps_folder, copy_instead_of_move, backup_id)
+                            # Определяем, копировать или перемещать
+                            should_copy = not self._is_file_in_scene_folder(master_file, analysis)
+                            if should_copy:
+                                self._log(f"   📋 Файл вне папки сцены, будет скопирован: {master_file.name}")
+                            
+                            op = self._move_file(master_file, maps_folder, should_copy, backup_id)
                             result.operations.append(op)
                             if op.success:
                                 result.files_moved += 1
@@ -252,11 +281,13 @@ class FileManager:
                                     self._log(f"      ⚠ Разный контент: {other_file.parent.name}/{other_file.name}")
                                     if self.enable_backup and backup_id:
                                         self.backup_manager.create_backup(other_file, backup_id)
-                                    op = self._move_file(other_file, maps_folder, copy_instead_of_move, backup_id, rename=True)
+                                    # Определяем, копировать или перемещать
+                                    should_copy = not self._is_file_in_scene_folder(other_file, analysis)
+                                    op = self._move_file(other_file, maps_folder, should_copy, backup_id, rename=True)
                                     result.operations.append(op)
             
             # === ШАГ 2: Неиспользуемые в unused ===
-            if move_unused and hasattr(analysis, 'unused_files'):
+            if move_unused and hasattr(analysis, 'unused_files') and unused_folder and unused_folder.exists():
                 self._log(f"\n{'='*50}")
                 self._log(f"🗑️ НЕИСПОЛЬЗУЕМЫЕ → UNUSED")
                 self._log(f"{'='*50}")
@@ -278,8 +309,30 @@ class FileManager:
                     if self.enable_backup and backup_id:
                         self.backup_manager.create_backup(file_path, backup_id)
                     
-                    op = self._move_file(file_path, unused_folder, copy_instead_of_move, backup_id)
+                    # Для неиспользуемых файлов также проверяем расположение
+                    # Если файл вне папки сцены - копируем, иначе перемещаем
+                    should_copy = not self._is_file_in_scene_folder(file_path, analysis)
+                    
+                    op = self._move_file(file_path, unused_folder, should_copy, backup_id)
                     result.operations.append(op)
+            
+            # Проверяем, осталась ли папка unused пустой после обработки
+            if move_unused and unused_folder.exists():
+                try:
+                    # Проверяем, есть ли файлы в папке
+                    has_files = False
+                    for item in unused_folder.iterdir():
+                        has_files = True
+                        break
+                    
+                    # Если папка пуста, удаляем её
+                    if not has_files:
+                        unused_folder.rmdir()
+                        result.unused_folder = None
+                        self._log(f"🗑️ Папка unused была пуста и удалена")
+                except Exception as e:
+                    # Игнорируем ошибки при проверке/удалении
+                    pass
             
             # === ШАГ 3: Удаление пустых папок ===
             self._log(f"\n{'='*50}")
@@ -321,6 +374,52 @@ class FileManager:
             return folder == file_path.parent or folder in file_path.parents
         except Exception:
             return False
+    
+    def _is_file_in_scene_folder(self, file_path: Path, analysis) -> bool:
+        """
+        Проверяет, находится ли файл внутри папки какой-либо сцены.
+        Если файл находится внутри папки сцены (или её подпапок), его нужно перемещать.
+        Если файл находится вне всех папок сцен, его нужно копировать.
+        
+        Args:
+            file_path: Путь к файлу для проверки
+            analysis: Объект AnalysisResult с информацией о сценах
+            
+        Returns:
+            True если файл находится внутри папки сцены, False если вне
+        """
+        if not hasattr(analysis, 'scenes') or not analysis.scenes:
+            # Если нет информации о сценах, считаем что файл внутри (старое поведение)
+            return True
+        
+        try:
+            file_path = Path(file_path).resolve()
+            
+            # Проверяем каждую сцену
+            for scene_path in analysis.scenes:
+                scene_path = Path(scene_path)
+                if not scene_path.exists():
+                    continue
+                
+                # Получаем папку сцены (родительскую папку .max файла)
+                scene_folder = scene_path.parent.resolve()
+                
+                # Проверяем, находится ли файл внутри папки сцены
+                # Используем relative_to для надежной проверки
+                try:
+                    file_path.relative_to(scene_folder)
+                    # Если не выброшено исключение, файл находится внутри папки сцены
+                    return True
+                except (ValueError, OSError):
+                    # Файл не находится в этой папке сцены, проверяем следующую
+                    continue
+            
+            # Файл не находится ни в одной папке сцены
+            return False
+            
+        except Exception:
+            # В случае ошибки считаем что файл внутри (безопасное поведение)
+            return True
     
     def _move_file(self, source: Path, dest_folder: Path, 
                    copy_mode: bool = False, backup_id: Optional[str] = None,

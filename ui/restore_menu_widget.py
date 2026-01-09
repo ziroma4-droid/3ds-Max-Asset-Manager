@@ -71,25 +71,35 @@ class RestoreMenuWidget(QWidget):
         self.restore_btn.clicked.connect(self.restore_selected_folder)
         actions_layout.addWidget(self.restore_btn)
         
+        self.delete_btn = QPushButton("🗑️ Удалить выбранную позицию")
+        self.delete_btn.setMinimumHeight(40)
+        self.delete_btn.setEnabled(False)
+        self.delete_btn.clicked.connect(self.delete_selected_folder)
+        actions_layout.addWidget(self.delete_btn)
+        
         actions_layout.addStretch()
         layout.addLayout(actions_layout)
     
     def update_folders_list(self):
-        """Обновляет список папок"""
+        """Обновляет список операций (каждая операция организации - отдельная запись)"""
         self.folders_list.clear()
         
-        folders = self.operation_history.get_folders_with_operations()
+        operations_list = self.operation_history.get_folders_with_operations()
         
-        if not folders:
-            item = QListWidgetItem("Нет папок с операциями для восстановления")
+        if not operations_list:
+            item = QListWidgetItem("Нет операций для восстановления")
             item.setFlags(Qt.ItemFlag.NoItemFlags)
             self.folders_list.addItem(item)
             self.restore_btn.setEnabled(False)
+            self.delete_btn.setEnabled(False)
             return
         
-        for base_folder, info in sorted(folders.items(), 
-                                       key=lambda x: x[1]['timestamp'], 
-                                       reverse=True):
+        # Сортируем по дате (самые новые сначала)
+        operations_list.sort(key=lambda x: x['timestamp'], reverse=True)
+        
+        for info in operations_list:
+            base_folder = info['base_folder']
+            backup_id = info['backup_id']
             try:
                 timestamp = datetime.fromisoformat(info['timestamp'])
                 timestamp_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
@@ -102,27 +112,32 @@ class RestoreMenuWidget(QWidget):
                 if len(folder_path) > 80:
                     folder_path = "..." + folder_path[-77:]
                 
+                # Обрезаем backup_id для отображения
+                backup_id_short = backup_id[:8] + "..." if len(backup_id) > 8 else backup_id
+                
                 text = f"📁 {folder_name}\n"
                 text += f"   Путь: {folder_path}\n"
                 text += f"   Операций: {info['operations_count']}\n"
+                text += f"   ID: {backup_id_short}\n"
                 text += f"   Дата: {timestamp_str}"
                 
                 item = QListWidgetItem(text)
                 item.setData(Qt.ItemDataRole.UserRole, {
                     'base_folder': base_folder,
-                    'backup_id': info['backup_id'],
+                    'backup_id': backup_id,
                     'info': info
                 })
                 self.folders_list.addItem(item)
             except Exception as e:
-                print(f"Ошибка при добавлении папки в список: {e}")
+                print(f"Ошибка при добавлении операции в список: {e}")
         
         # Подключаем сигнал выбора
-        self.folders_list.itemSelectionChanged.connect(
-            lambda: self.restore_btn.setEnabled(
-                len(self.folders_list.selectedItems()) > 0
-            )
-        )
+        def update_buttons():
+            has_selection = len(self.folders_list.selectedItems()) > 0
+            self.restore_btn.setEnabled(has_selection)
+            self.delete_btn.setEnabled(has_selection)
+        
+        self.folders_list.itemSelectionChanged.connect(update_buttons)
     
     def restore_selected_folder(self):
         """Восстанавливает выбранную папку"""
@@ -141,14 +156,16 @@ class RestoreMenuWidget(QWidget):
         info = data['info']
         
         # Подтверждение
-        msg = f"⚠️ ВОССТАНОВЛЕНИЕ ПАПКИ\n\n"
+        backup_id_short = backup_id[:8] + "..." if len(backup_id) > 8 else backup_id
+        msg = f"⚠️ ВОССТАНОВЛЕНИЕ ОПЕРАЦИИ\n\n"
         msg += f"Папка: {base_folder.name}\n"
-        msg += f"Путь: {base_folder}\n\n"
+        msg += f"Путь: {base_folder}\n"
+        msg += f"ID операции: {backup_id_short}\n\n"
         msg += f"Будет восстановлено:\n"
         msg += f"• Файлов: {info['operations_count']}\n"
         msg += f"• Дата операции: {datetime.fromisoformat(info['timestamp']).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         msg += f"⚠️ ВНИМАНИЕ: Все текущие изменения в папке будут перезаписаны!\n\n"
-        msg += f"Вы уверены, что хотите восстановить эту папку?"
+        msg += f"Вы уверены, что хотите восстановить эту операцию?"
         
         reply = QMessageBox.warning(
             self, "⚠️ Подтверждение восстановления", msg,
@@ -182,5 +199,81 @@ class RestoreMenuWidget(QWidget):
             QMessageBox.critical(
                 self, "Ошибка",
                 f"Произошла ошибка при восстановлении:\n{str(e)}"
+            )
+    
+    def delete_selected_folder(self):
+        """Удаляет выбранную позицию из истории и временных файлов"""
+        selected_items = self.folders_list.selectedItems()
+        if not selected_items:
+            return
+        
+        item = selected_items[0]
+        data = item.data(Qt.ItemDataRole.UserRole)
+        
+        if not data:
+            return
+        
+        base_folder = data['base_folder']
+        backup_id = data['backup_id']
+        info = data['info']
+        
+        # Подтверждение
+        backup_id_short = backup_id[:8] + "..." if len(backup_id) > 8 else backup_id
+        msg = f"⚠️ УДАЛЕНИЕ ОПЕРАЦИИ ИЗ ИСТОРИИ\n\n"
+        msg += f"Папка: {base_folder.name}\n"
+        msg += f"Путь: {base_folder}\n"
+        msg += f"ID операции: {backup_id_short}\n\n"
+        msg += f"Будет удалено:\n"
+        msg += f"• Операций из истории: {info['operations_count']}\n"
+        msg += f"• Резервная копия: {backup_id_short}\n"
+        msg += f"• Дата операции: {datetime.fromisoformat(info['timestamp']).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        msg += f"⚠️ ВНИМАНИЕ: Это действие нельзя отменить!\n"
+        msg += f"Резервная копия и история операций будут удалены безвозвратно.\n\n"
+        msg += f"Вы уверены, что хотите удалить эту операцию?"
+        
+        reply = QMessageBox.warning(
+            self, "⚠️ Подтверждение удаления", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        # Удаляем
+        try:
+            # Удаляем из истории операций только для конкретного backup_id
+            operations_to_delete = self.operation_history.get_operations_by_backup_id(backup_id)
+            deleted_ops = 0
+            for op in operations_to_delete:
+                if op in self.operation_history.operations:
+                    self.operation_history.operations.remove(op)
+                    deleted_ops += 1
+            if deleted_ops > 0:
+                self.operation_history._save_history()
+            
+            # Удаляем резервную копию
+            backup_manager = BackupManager(base_folder)
+            backup_deleted = backup_manager.delete_backup(backup_id)
+            
+            if deleted_ops > 0 or backup_deleted:
+                QMessageBox.information(
+                    self, "Успешно",
+                    f"Позиция успешно удалена!\n\n"
+                    f"• Удалено операций из истории: {deleted_ops}\n"
+                    f"• Резервная копия удалена: {'Да' if backup_deleted else 'Нет'}"
+                )
+                # Обновляем список
+                self.update_folders_list()
+            else:
+                QMessageBox.warning(
+                    self, "Предупреждение",
+                    "Не удалось удалить позицию.\n"
+                    "Возможно, она уже была удалена."
+                )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Ошибка",
+                f"Произошла ошибка при удалении:\n{str(e)}"
             )
 

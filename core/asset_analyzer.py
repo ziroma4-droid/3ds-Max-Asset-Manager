@@ -281,8 +281,73 @@ class AssetAnalyzer:
         if self.debug:
             result.debug_info.append(f"\n📋 Имён в сцене: {len(scene_names_index)}")
         
-        # Проверяем каждый файл в папке
+        # Сначала проверяем файлы по полным путям из сцены (включая внешние библиотеки)
+        for asset_path_str in result.all_used_assets:
+            try:
+                asset_path = Path(asset_path_str)
+                # Проверяем, существует ли файл по пути из сцены
+                if asset_path.exists():
+                    # Добавляем в linked_files, даже если он вне папки проекта
+                    result.linked_files.add(asset_path)
+                    
+                    # Если файл уже есть в all_files_info (найден при сканировании папки)
+                    if asset_path in result.all_files_info:
+                        file_info = result.all_files_info[asset_path]
+                        file_info.is_used = True
+                        file_info.used_in_scenes.append(asset_path_str)
+                    else:
+                        # Файл из внешней библиотеки - создаём FileInfo для него
+                        ext = asset_path.suffix.lower()
+                        if ext in self.TEXTURE_EXTENSIONS:
+                            file_type = 'texture'
+                        elif ext in self.PROXY_EXTENSIONS:
+                            file_type = 'proxy'
+                        else:
+                            file_type = 'other'
+                        
+                        # Определяем подпапку относительно папки проекта или используем полный путь
+                        try:
+                            rel_path = asset_path.relative_to(result.folder_path)
+                            if len(rel_path.parts) > 1:
+                                subfolder = rel_path.parts[0]
+                            else:
+                                subfolder = "(корень)"
+                        except ValueError:
+                            # Файл вне папки проекта - используем родительскую папку
+                            subfolder = f"(внешняя: {asset_path.parent.name})"
+                        
+                        file_info = FileInfo(
+                            path=asset_path,
+                            name=asset_path.name,
+                            extension=ext,
+                            folder=subfolder,
+                            file_type=file_type,
+                            is_used=True,
+                            used_in_scenes=[asset_path_str]
+                        )
+                        result.all_files_info[asset_path] = file_info
+                        
+                        # Добавляем в соответствующие наборы
+                        if file_type == 'texture':
+                            result.folder_textures.add(asset_path)
+                        elif file_type == 'proxy':
+                            result.folder_proxies.add(asset_path)
+                        else:
+                            result.folder_other.add(asset_path)
+                        
+                        if self.debug:
+                            result.debug_info.append(f"  ✓ Внешняя библиотека: {asset_path}")
+            except Exception as e:
+                if self.debug:
+                    result.debug_info.append(f"  ⚠ Ошибка проверки пути {asset_path_str}: {e}")
+                continue
+        
+        # Проверяем каждый файл в папке проекта
         for file_path, file_info in result.all_files_info.items():
+            # Пропускаем файлы, которые уже обработаны выше
+            if file_info.is_used:
+                continue
+                
             file_name = file_path.name.lower()
             
             # Ищем по имени файла
@@ -301,18 +366,33 @@ class AssetAnalyzer:
                     result.debug_info.append(f"  ✗ {file_info.folder}/{file_name}")
         
         # Определяем отсутствующие файлы
-        folder_names = {f.name.lower() for f in result.all_folder_files}
-        
-        for asset_path in result.all_used_assets:
+        # Файл считается отсутствующим, если:
+        # 1. Он не существует по полному пути из сцены
+        # 2. И его нет в linked_files (не был найден ни по полному пути, ни по имени в папке проекта)
+        for asset_path_str in result.all_used_assets:
             try:
-                asset_name = Path(asset_path).name.lower()
+                asset_path_obj = Path(asset_path_str)
                 
-                if asset_name not in folder_names:
-                    if not Path(asset_path).exists():
-                        result.missing_files.add(asset_path)
+                # Проверяем, был ли файл найден
+                found = False
+                # Проверяем по полному пути
+                if asset_path_obj in result.linked_files:
+                    found = True
+                else:
+                    # Проверяем, есть ли файл с таким именем в linked_files
+                    asset_name = asset_path_obj.name.lower()
+                    for linked_file in result.linked_files:
+                        if linked_file.name.lower() == asset_name:
+                            found = True
+                            break
+                
+                # Если файл не найден и не существует по полному пути
+                if not found and not asset_path_obj.exists():
+                    result.missing_files.add(asset_path_str)
                         
             except Exception:
-                result.missing_files.add(asset_path)
+                # В случае ошибки считаем файл отсутствующим
+                result.missing_files.add(asset_path_str)
     
     def _collect_stats(self, result: AnalysisResult):
         """Собирает статистику по папкам"""

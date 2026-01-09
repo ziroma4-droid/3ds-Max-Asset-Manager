@@ -42,8 +42,9 @@ class RestoreMenuWidget(QWidget):
         layout.addWidget(header_label)
         
         info_label = QLabel(
-            "Выберите папку для восстановления в исходное состояние.\n"
-            "Все файлы будут восстановлены из резервной копии."
+            "Выберите операцию для восстановления в исходное состояние.\n"
+            "Все файлы будут восстановлены из резервной копии.\n"
+            "💡 Подсказка: Используйте Ctrl или Shift для выбора нескольких операций при удалении."
         )
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
@@ -54,6 +55,8 @@ class RestoreMenuWidget(QWidget):
         
         self.folders_list = QListWidget()
         self.folders_list.setMinimumHeight(200)
+        # Включаем множественный выбор (Ctrl для отдельных элементов, Shift для диапазона)
+        self.folders_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         folders_layout.addWidget(self.folders_list)
         
         refresh_btn = QPushButton("🔄 Обновить список")
@@ -71,7 +74,7 @@ class RestoreMenuWidget(QWidget):
         self.restore_btn.clicked.connect(self.restore_selected_folder)
         actions_layout.addWidget(self.restore_btn)
         
-        self.delete_btn = QPushButton("🗑️ Удалить выбранную позицию")
+        self.delete_btn = QPushButton("🗑️ Удалить выбранные позиции")
         self.delete_btn.setMinimumHeight(40)
         self.delete_btn.setEnabled(False)
         self.delete_btn.clicked.connect(self.delete_selected_folder)
@@ -133,9 +136,16 @@ class RestoreMenuWidget(QWidget):
         
         # Подключаем сигнал выбора
         def update_buttons():
-            has_selection = len(self.folders_list.selectedItems()) > 0
-            self.restore_btn.setEnabled(has_selection)
-            self.delete_btn.setEnabled(has_selection)
+            selected_count = len(self.folders_list.selectedItems())
+            # Восстановление работает только для одной записи
+            self.restore_btn.setEnabled(selected_count == 1)
+            # Удаление работает для одной или нескольких записей
+            self.delete_btn.setEnabled(selected_count > 0)
+            # Обновляем текст кнопки удаления
+            if selected_count > 1:
+                self.delete_btn.setText(f"🗑️ Удалить выбранные позиции ({selected_count})")
+            else:
+                self.delete_btn.setText("🗑️ Удалить выбранную позицию")
         
         self.folders_list.itemSelectionChanged.connect(update_buttons)
     
@@ -202,34 +212,68 @@ class RestoreMenuWidget(QWidget):
             )
     
     def delete_selected_folder(self):
-        """Удаляет выбранную позицию из истории и временных файлов"""
+        """Удаляет выбранные позиции из истории и временных файлов"""
         selected_items = self.folders_list.selectedItems()
         if not selected_items:
             return
         
-        item = selected_items[0]
-        data = item.data(Qt.ItemDataRole.UserRole)
+        # Собираем данные о выбранных операциях
+        operations_to_delete = []
+        total_ops_count = 0
         
-        if not data:
+        for item in selected_items:
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if not data:
+                continue
+            
+            operations_to_delete.append({
+                'base_folder': data['base_folder'],
+                'backup_id': data['backup_id'],
+                'info': data['info']
+            })
+            total_ops_count += data['info']['operations_count']
+        
+        if not operations_to_delete:
             return
         
-        base_folder = data['base_folder']
-        backup_id = data['backup_id']
-        info = data['info']
-        
         # Подтверждение
-        backup_id_short = backup_id[:8] + "..." if len(backup_id) > 8 else backup_id
-        msg = f"⚠️ УДАЛЕНИЕ ОПЕРАЦИИ ИЗ ИСТОРИИ\n\n"
-        msg += f"Папка: {base_folder.name}\n"
-        msg += f"Путь: {base_folder}\n"
-        msg += f"ID операции: {backup_id_short}\n\n"
-        msg += f"Будет удалено:\n"
-        msg += f"• Операций из истории: {info['operations_count']}\n"
-        msg += f"• Резервная копия: {backup_id_short}\n"
-        msg += f"• Дата операции: {datetime.fromisoformat(info['timestamp']).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        if len(operations_to_delete) == 1:
+            # Одна операция
+            op = operations_to_delete[0]
+            base_folder = op['base_folder']
+            backup_id = op['backup_id']
+            info = op['info']
+            backup_id_short = backup_id[:8] + "..." if len(backup_id) > 8 else backup_id
+            
+            msg = f"⚠️ УДАЛЕНИЕ ОПЕРАЦИИ ИЗ ИСТОРИИ\n\n"
+            msg += f"Папка: {base_folder.name}\n"
+            msg += f"Путь: {base_folder}\n"
+            msg += f"ID операции: {backup_id_short}\n\n"
+            msg += f"Будет удалено:\n"
+            msg += f"• Операций из истории: {info['operations_count']}\n"
+            msg += f"• Резервная копия: {backup_id_short}\n"
+            msg += f"• Дата операции: {datetime.fromisoformat(info['timestamp']).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        else:
+            # Несколько операций
+            msg = f"⚠️ УДАЛЕНИЕ ОПЕРАЦИЙ ИЗ ИСТОРИИ\n\n"
+            msg += f"Выбрано операций: {len(operations_to_delete)}\n"
+            msg += f"Всего операций в истории: {total_ops_count}\n\n"
+            msg += f"Будет удалено:\n"
+            msg += f"• Операций из истории: {total_ops_count}\n"
+            msg += f"• Резервных копий: {len(operations_to_delete)}\n\n"
+            msg += f"Папки:\n"
+            # Показываем первые 5 папок
+            for i, op in enumerate(operations_to_delete[:5]):
+                folder_name = op['base_folder'].name if op['base_folder'].name else str(op['base_folder'])
+                backup_id_short = op['backup_id'][:8] + "..." if len(op['backup_id']) > 8 else op['backup_id']
+                msg += f"  {i+1}. {folder_name} (ID: {backup_id_short})\n"
+            if len(operations_to_delete) > 5:
+                msg += f"  ... и еще {len(operations_to_delete) - 5} операций\n"
+            msg += "\n"
+        
         msg += f"⚠️ ВНИМАНИЕ: Это действие нельзя отменить!\n"
-        msg += f"Резервная копия и история операций будут удалены безвозвратно.\n\n"
-        msg += f"Вы уверены, что хотите удалить эту операцию?"
+        msg += f"Резервные копии и история операций будут удалены безвозвратно.\n\n"
+        msg += f"Вы уверены, что хотите удалить {'эту операцию' if len(operations_to_delete) == 1 else 'эти операции'}?"
         
         reply = QMessageBox.warning(
             self, "⚠️ Подтверждение удаления", msg,
@@ -240,36 +284,58 @@ class RestoreMenuWidget(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
         
-        # Удаляем
+        # Удаляем все выбранные операции
+        deleted_ops_total = 0
+        deleted_backups = 0
+        failed_backups = []
+        
         try:
-            # Удаляем из истории операций только для конкретного backup_id
-            operations_to_delete = self.operation_history.get_operations_by_backup_id(backup_id)
-            deleted_ops = 0
-            for op in operations_to_delete:
-                if op in self.operation_history.operations:
-                    self.operation_history.operations.remove(op)
-                    deleted_ops += 1
-            if deleted_ops > 0:
+            for op_data in operations_to_delete:
+                base_folder = op_data['base_folder']
+                backup_id = op_data['backup_id']
+                
+                # Удаляем из истории операций
+                operations_to_remove = self.operation_history.get_operations_by_backup_id(backup_id)
+                for op in operations_to_remove:
+                    if op in self.operation_history.operations:
+                        self.operation_history.operations.remove(op)
+                        deleted_ops_total += 1
+                
+                # Удаляем резервную копию
+                try:
+                    backup_manager = BackupManager(base_folder)
+                    if backup_manager.delete_backup(backup_id):
+                        deleted_backups += 1
+                    else:
+                        failed_backups.append(backup_id[:8] + "...")
+                except Exception as e:
+                    failed_backups.append(f"{backup_id[:8]}... ({str(e)})")
+            
+            # Сохраняем историю после всех удалений
+            if deleted_ops_total > 0:
                 self.operation_history._save_history()
             
-            # Удаляем резервную копию
-            backup_manager = BackupManager(base_folder)
-            backup_deleted = backup_manager.delete_backup(backup_id)
-            
-            if deleted_ops > 0 or backup_deleted:
-                QMessageBox.information(
-                    self, "Успешно",
-                    f"Позиция успешно удалена!\n\n"
-                    f"• Удалено операций из истории: {deleted_ops}\n"
-                    f"• Резервная копия удалена: {'Да' if backup_deleted else 'Нет'}"
-                )
+            # Показываем результат
+            if deleted_ops_total > 0 or deleted_backups > 0:
+                result_msg = f"Операции успешно удалены!\n\n"
+                result_msg += f"• Удалено операций из истории: {deleted_ops_total}\n"
+                result_msg += f"• Удалено резервных копий: {deleted_backups} из {len(operations_to_delete)}\n"
+                
+                if failed_backups:
+                    result_msg += f"\n⚠️ Не удалось удалить резервные копии:\n"
+                    for backup_id in failed_backups[:5]:
+                        result_msg += f"  • {backup_id}\n"
+                    if len(failed_backups) > 5:
+                        result_msg += f"  ... и еще {len(failed_backups) - 5}\n"
+                
+                QMessageBox.information(self, "Успешно", result_msg)
                 # Обновляем список
                 self.update_folders_list()
             else:
                 QMessageBox.warning(
                     self, "Предупреждение",
-                    "Не удалось удалить позицию.\n"
-                    "Возможно, она уже была удалена."
+                    "Не удалось удалить операции.\n"
+                    "Возможно, они уже были удалены."
                 )
         except Exception as e:
             QMessageBox.critical(

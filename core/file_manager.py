@@ -6,10 +6,15 @@
 import os
 import shutil
 import hashlib
+import uuid
 from pathlib import Path
 from typing import List, Set, Dict, Optional, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+
+from .backup_manager import BackupManager
+from .operation_history import OperationHistory, Operation, OperationType
+from .file_integrity import FileIntegrityChecker
 
 
 @dataclass
@@ -31,6 +36,8 @@ class OrganizeResult:
     duplicates_deleted: int = 0
     files_moved: int = 0
     files_skipped: int = 0
+    backup_id: Optional[str] = None
+    integrity_errors: List[Dict] = field(default_factory=list)
     
     @property
     def successful_moves(self) -> List[MoveOperation]:
@@ -44,8 +51,14 @@ class OrganizeResult:
 class FileManager:
     """Менеджер для организации файлов ассетов"""
     
-    def __init__(self, progress_callback: Optional[Callable[[str], None]] = None):
+    def __init__(self, progress_callback: Optional[Callable[[str], None]] = None,
+                 enable_backup: bool = False,
+                 check_integrity: bool = True):
         self.progress_callback = progress_callback
+        self.enable_backup = enable_backup
+        self.check_integrity = check_integrity
+        self.backup_manager: Optional[BackupManager] = None
+        self.operation_history = OperationHistory()
     
     def _log(self, message: str):
         if self.progress_callback:
@@ -92,6 +105,16 @@ class FileManager:
         try:
             base_folder = Path(analysis.folder_path)
             self._log(f"📂 Папка проекта: {base_folder}")
+            
+            # Инициализируем резервное копирование если нужно
+            if self.enable_backup:
+                self.backup_manager = BackupManager(base_folder)
+                self.backup_manager.cleanup_old_backups()
+                backup_id = str(uuid.uuid4())
+                result.backup_id = backup_id
+                self._log(f"💾 Резервное копирование включено (ID: {backup_id[:8]}...)")
+            else:
+                backup_id = None
             
             maps_folder = base_folder / "maps"
             unused_folder = base_folder / "unused"
@@ -141,7 +164,21 @@ class FileManager:
                             result.files_skipped += 1
                             continue
                         
-                        op = self._move_file(file_path, maps_folder, copy_instead_of_move)
+                        # Проверка целостности
+                        if self.check_integrity:
+                            is_valid, error = FileIntegrityChecker.check_image_integrity(file_path)
+                            if not is_valid:
+                                result.integrity_errors.append({
+                                    'file': str(file_path),
+                                    'error': error
+                                })
+                                self._log(f"   ⚠️ Поврежден: {file_name} - {error}")
+                        
+                        # Резервное копирование
+                        if self.enable_backup and backup_id:
+                            self.backup_manager.create_backup(file_path, backup_id)
+                        
+                        op = self._move_file(file_path, maps_folder, copy_instead_of_move, backup_id)
                         result.operations.append(op)
                         if op.success:
                             result.files_moved += 1
@@ -166,19 +203,37 @@ class FileManager:
                                 other_hash = self._get_file_hash(other_file)
                                 
                                 if other_hash == master_hash and delete_duplicates:
-                                    op = self._delete_file(other_file, "дубликат")
+                                    # Резервное копирование перед удалением
+                                    if self.enable_backup and backup_id:
+                                        self.backup_manager.create_backup(other_file, backup_id)
+                                    op = self._delete_file(other_file, "дубликат", backup_id)
                                     result.operations.append(op)
                                     if op.success:
                                         result.duplicates_deleted += 1
                                 else:
                                     self._log(f"      ⚠ Разный контент: {other_file.parent.name}/{other_file.name}")
-                                    op = self._move_file(other_file, maps_folder, copy_instead_of_move, rename=True)
+                                    if self.enable_backup and backup_id:
+                                        self.backup_manager.create_backup(other_file, backup_id)
+                                    op = self._move_file(other_file, maps_folder, copy_instead_of_move, backup_id, rename=True)
                                     result.operations.append(op)
                         else:
                             master_file = others[0]
                             master_hash = self._get_file_hash(master_file)
                             
-                            op = self._move_file(master_file, maps_folder, copy_instead_of_move)
+                            # Проверка целостности и резервное копирование для master_file
+                            if self.check_integrity:
+                                is_valid, error = FileIntegrityChecker.check_image_integrity(master_file)
+                                if not is_valid:
+                                    result.integrity_errors.append({
+                                        'file': str(master_file),
+                                        'error': error
+                                    })
+                                    self._log(f"   ⚠️ Поврежден: {master_file.name} - {error}")
+                            
+                            if self.enable_backup and backup_id:
+                                self.backup_manager.create_backup(master_file, backup_id)
+                            
+                            op = self._move_file(master_file, maps_folder, copy_instead_of_move, backup_id)
                             result.operations.append(op)
                             if op.success:
                                 result.files_moved += 1
@@ -187,13 +242,17 @@ class FileManager:
                                 other_hash = self._get_file_hash(other_file)
                                 
                                 if other_hash == master_hash and delete_duplicates:
-                                    op = self._delete_file(other_file, "дубликат")
+                                    if self.enable_backup and backup_id:
+                                        self.backup_manager.create_backup(other_file, backup_id)
+                                    op = self._delete_file(other_file, "дубликат", backup_id)
                                     result.operations.append(op)
                                     if op.success:
                                         result.duplicates_deleted += 1
                                 else:
                                     self._log(f"      ⚠ Разный контент: {other_file.parent.name}/{other_file.name}")
-                                    op = self._move_file(other_file, maps_folder, copy_instead_of_move, rename=True)
+                                    if self.enable_backup and backup_id:
+                                        self.backup_manager.create_backup(other_file, backup_id)
+                                    op = self._move_file(other_file, maps_folder, copy_instead_of_move, backup_id, rename=True)
                                     result.operations.append(op)
             
             # === ШАГ 2: Неиспользуемые в unused ===
@@ -215,7 +274,11 @@ class FileManager:
                     if self._is_in_folder(file_path, unused_folder):
                         continue
                     
-                    op = self._move_file(file_path, unused_folder, copy_instead_of_move)
+                    # Резервное копирование
+                    if self.enable_backup and backup_id:
+                        self.backup_manager.create_backup(file_path, backup_id)
+                    
+                    op = self._move_file(file_path, unused_folder, copy_instead_of_move, backup_id)
                     result.operations.append(op)
             
             # === ИТОГИ ===
@@ -246,7 +309,8 @@ class FileManager:
             return False
     
     def _move_file(self, source: Path, dest_folder: Path, 
-                   copy_mode: bool = False, rename: bool = False) -> MoveOperation:
+                   copy_mode: bool = False, backup_id: Optional[str] = None,
+                   rename: bool = False) -> MoveOperation:
         source = Path(source)
         dest_folder = Path(dest_folder)
         
@@ -270,22 +334,62 @@ class FileManager:
             if copy_mode:
                 shutil.copy2(str(source), str(dest))
                 self._log(f"   📋 Скопирован: {source.parent.name}/{source.name}")
+                op_type = OperationType.COPY
             else:
                 shutil.move(str(source), str(dest))
                 self._log(f"   📦 Перемещен: {source.parent.name}/{source.name}")
+                op_type = OperationType.MOVE
             
             operation.success = True
+            
+            # Добавляем в историю
+            history_op = Operation(
+                id=str(uuid.uuid4()),
+                type=op_type,
+                source=source,
+                destination=dest,
+                success=True,
+                backup_id=backup_id,
+                base_folder=self.backup_manager.base_folder if self.backup_manager else None
+            )
+            self.operation_history.add_operation(history_op)
             
         except PermissionError:
             operation.error = "Нет доступа"
             self._log(f"   ❌ Нет доступа: {source.name}")
+            
+            # Добавляем в историю с ошибкой
+            history_op = Operation(
+                id=str(uuid.uuid4()),
+                type=OperationType.MOVE if not copy_mode else OperationType.COPY,
+                source=source,
+                destination=dest,
+                success=False,
+                error="Нет доступа",
+                backup_id=backup_id,
+                base_folder=self.backup_manager.base_folder if self.backup_manager else None
+            )
+            self.operation_history.add_operation(history_op)
         except Exception as e:
             operation.error = str(e)
             self._log(f"   ❌ Ошибка: {source.name} - {e}")
+            
+            # Добавляем в историю с ошибкой
+            history_op = Operation(
+                id=str(uuid.uuid4()),
+                type=OperationType.MOVE if not copy_mode else OperationType.COPY,
+                source=source,
+                destination=dest,
+                success=False,
+                error=str(e),
+                backup_id=backup_id,
+                base_folder=self.backup_manager.base_folder if self.backup_manager else None
+            )
+            self.operation_history.add_operation(history_op)
         
         return operation
     
-    def _delete_file(self, file_path: Path, reason: str = "") -> MoveOperation:
+    def _delete_file(self, file_path: Path, reason: str = "", backup_id: Optional[str] = None) -> MoveOperation:
         operation = MoveOperation(
             source=file_path,
             destination=Path("(удалён)"),
@@ -296,11 +400,90 @@ class FileManager:
             file_path.unlink()
             self._log(f"   🗑️ Удалён ({reason}): {file_path.parent.name}/{file_path.name}")
             operation.success = True
+            
+            # Добавляем в историю
+            history_op = Operation(
+                id=str(uuid.uuid4()),
+                type=OperationType.DELETE,
+                source=file_path,
+                success=True,
+                backup_id=backup_id,
+                base_folder=self.backup_manager.base_folder if self.backup_manager else None
+            )
+            self.operation_history.add_operation(history_op)
         except Exception as e:
             operation.error = str(e)
             self._log(f"   ❌ Не удалось удалить: {file_path.name}")
+            
+            # Добавляем в историю с ошибкой
+            history_op = Operation(
+                id=str(uuid.uuid4()),
+                type=OperationType.DELETE,
+                source=file_path,
+                success=False,
+                error=str(e),
+                backup_id=backup_id,
+                base_folder=self.backup_manager.base_folder if self.backup_manager else None
+            )
+            self.operation_history.add_operation(history_op)
         
         return operation
+    
+    def restore_folder(self, base_folder: Path, backup_id: str) -> bool:
+        """
+        Восстанавливает всю папку из резервной копии
+        
+        Args:
+            base_folder: Корневая папка для восстановления
+            backup_id: Идентификатор резервной копии
+            
+        Returns:
+            True если успешно
+        """
+        if not self.backup_manager:
+            # Создаем BackupManager для этой папки
+            self.backup_manager = BackupManager(base_folder)
+        
+        return self.backup_manager.restore_backup(backup_id)
+    
+    def undo_last_operation(self) -> bool:
+        """Отменяет последнюю операцию"""
+        if not self.operation_history.can_undo():
+            return False
+        
+        last_op = self.operation_history.get_last_operation()
+        if not last_op or not last_op.success:
+            return False
+        
+        try:
+            if last_op.type == OperationType.MOVE:
+                # Возвращаем файл обратно
+                if last_op.destination and last_op.destination.exists():
+                    shutil.move(str(last_op.destination), str(last_op.source))
+            elif last_op.type == OperationType.COPY:
+                # Удаляем копию
+                if last_op.destination and last_op.destination.exists():
+                    last_op.destination.unlink()
+            elif last_op.type == OperationType.DELETE:
+                # Восстанавливаем из резервной копии
+                if last_op.backup_id and self.backup_manager:
+                    return self.backup_manager.restore_backup(last_op.backup_id)
+            
+            # Добавляем операцию восстановления в историю
+            restore_op = Operation(
+                id=str(uuid.uuid4()),
+                type=OperationType.RESTORE,
+                source=last_op.source,
+                destination=last_op.destination,
+                success=True,
+                backup_id=last_op.backup_id,
+                base_folder=last_op.base_folder
+            )
+            self.operation_history.add_operation(restore_op)
+            
+            return True
+        except Exception as e:
+            return False
     
     @staticmethod
     def _get_unique_name(path: Path) -> Path:

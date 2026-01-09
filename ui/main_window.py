@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QTextEdit, QFileDialog,
     QProgressBar, QGroupBox, QCheckBox, QTabWidget, QMessageBox,
-    QFrame, QListWidget, QListWidgetItem
+    QFrame, QListWidget, QListWidgetItem, QDialog, QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
 from PyQt6.QtGui import QFont, QTextCursor, QColor, QBrush
@@ -23,6 +23,7 @@ from core import AssetAnalyzer, FileManager, AnalysisResult, OrganizeResult
 from core.asset_analyzer import FileInfo
 from ui.statistics_widget import StatisticsWidget
 from ui.folder_tree_widget import FolderTreeWidget
+from ui.restore_menu_widget import RestoreMenuWidget
 
 
 class AnalyzerThread(QThread):
@@ -68,13 +69,17 @@ class OrganizerThread(QThread):
                  create_maps: bool = True,
                  move_unused: bool = True,
                  copy_mode: bool = False,
-                 delete_duplicates: bool = True):
+                 delete_duplicates: bool = True,
+                 enable_backup: bool = False,
+                 check_integrity: bool = True):
         super().__init__()
         self.analysis = analysis
         self.create_maps = create_maps
         self.move_unused = move_unused
         self.copy_mode = copy_mode
         self.delete_duplicates = delete_duplicates
+        self.enable_backup = enable_backup
+        self.check_integrity = check_integrity
     
     def run(self):
         result = None
@@ -86,7 +91,11 @@ class OrganizerThread(QThread):
                 except (RuntimeError, TypeError):
                     pass
             
-            manager = FileManager(progress_callback=safe_progress)
+            manager = FileManager(
+                progress_callback=safe_progress,
+                enable_backup=self.enable_backup,
+                check_integrity=self.check_integrity
+            )
             
             result = manager.organize_assets(
                 self.analysis,
@@ -121,6 +130,8 @@ class MainWindow(QMainWindow):
         self.current_analysis: Optional[AnalysisResult] = None
         self.analyzer_thread = None
         self.organizer_thread = None
+        self.file_manager: Optional[FileManager] = None
+        self.last_organize_result = None
         
         self.init_ui()
         self.load_settings()
@@ -172,26 +183,43 @@ class MainWindow(QMainWindow):
         
                 # === Опции ===
         options_group = QGroupBox("Опции организации")
-        options_layout = QHBoxLayout(options_group)
+        options_layout = QVBoxLayout(options_group)
         
+        # Первая строка опций
+        options_row1 = QHBoxLayout()
         self.copy_mode_cb = QCheckBox("Копировать (не перемещать)")
-        options_layout.addWidget(self.copy_mode_cb)
+        options_row1.addWidget(self.copy_mode_cb)
         
         self.create_maps_cb = QCheckBox("Собрать в maps")
-        self.create_maps_cb.setChecked(True)  # Теперь по умолчанию включено
+        self.create_maps_cb.setChecked(True)
         self.create_maps_cb.setToolTip("Собрать все связанные файлы в папку maps")
-        options_layout.addWidget(self.create_maps_cb)
+        options_row1.addWidget(self.create_maps_cb)
         
         self.delete_duplicates_cb = QCheckBox("Удалять дубликаты")
         self.delete_duplicates_cb.setChecked(True)
         self.delete_duplicates_cb.setToolTip("Удалять файлы-дубликаты (одинаковое содержимое)")
-        options_layout.addWidget(self.delete_duplicates_cb)
+        options_row1.addWidget(self.delete_duplicates_cb)
         
         self.move_unused_cb = QCheckBox("Unused → папка")
         self.move_unused_cb.setChecked(True)
-        options_layout.addWidget(self.move_unused_cb)
+        options_row1.addWidget(self.move_unused_cb)
+        options_row1.addStretch()
+        options_layout.addLayout(options_row1)
         
-        options_layout.addStretch()
+        # Вторая строка опций
+        options_row2 = QHBoxLayout()
+        self.backup_cb = QCheckBox("💾 Резервное копирование")
+        self.backup_cb.setChecked(False)  # По умолчанию отключено
+        self.backup_cb.setToolTip("Создавать резервные копии файлов перед операциями (хранится 7 дней)")
+        options_row2.addWidget(self.backup_cb)
+        
+        self.check_integrity_cb = QCheckBox("🔍 Проверка целостности")
+        self.check_integrity_cb.setChecked(True)
+        self.check_integrity_cb.setToolTip("Проверять целостность изображений перед операциями")
+        options_row2.addWidget(self.check_integrity_cb)
+        options_row2.addStretch()
+        options_layout.addLayout(options_row2)
+        
         main_layout.addWidget(options_group)
 
         
@@ -214,6 +242,11 @@ class MainWindow(QMainWindow):
         self.save_report_btn.setEnabled(False)
         self.save_report_btn.clicked.connect(self.save_report)
         actions_layout.addWidget(self.save_report_btn)
+        
+        self.restore_menu_btn = QPushButton("↩️ Восстановить папку...")
+        self.restore_menu_btn.setMinimumHeight(40)
+        self.restore_menu_btn.clicked.connect(self.show_restore_menu)
+        actions_layout.addWidget(self.restore_menu_btn)
         
         main_layout.addLayout(actions_layout)
         
@@ -504,22 +537,39 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Информация", "Нет файлов для организации")
             return
         
-        msg = f"Будет выполнено:\n\n"
+        # Формируем детальное сообщение подтверждения
+        msg = f"⚠️ КРИТИЧЕСКАЯ ОПЕРАЦИЯ\n\n"
+        msg += f"Будет выполнено:\n"
+        msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        
         if self.create_maps_cb.isChecked():
             msg += f"• Собрать связанные файлы в maps: {linked_count}\n"
             if self.delete_duplicates_cb.isChecked():
-                msg += f"• Удалить дубликаты: Да\n"
+                msg += f"• ⚠️ Удалить дубликаты: Да\n"
         if self.move_unused_cb.isChecked():
             msg += f"• Переместить неиспользуемые в unused: {unused_count}\n"
         
+        msg += f"\nОпции:\n"
         if self.copy_mode_cb.isChecked():
-            msg += "\n⚠️ Режим: КОПИРОВАНИЕ"
+            msg += f"• Режим: КОПИРОВАНИЕ (файлы останутся на месте)\n"
         else:
-            msg += "\n⚠️ Режим: ПЕРЕМЕЩЕНИЕ"
+            msg += f"• ⚠️ Режим: ПЕРЕМЕЩЕНИЕ (файлы будут перемещены)\n"
         
-        reply = QMessageBox.question(
-            self, "Подтверждение", msg,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        if self.backup_cb.isChecked():
+            msg += f"• 💾 Резервное копирование: Включено\n"
+        else:
+            msg += f"• ⚠️ Резервное копирование: ОТКЛЮЧЕНО\n"
+        
+        if self.check_integrity_cb.isChecked():
+            msg += f"• 🔍 Проверка целостности: Включена\n"
+        
+        msg += f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += f"Вы уверены, что хотите продолжить?"
+        
+        reply = QMessageBox.warning(
+            self, "⚠️ Подтверждение критической операции", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No  # По умолчанию "Нет"
         )
         
         if reply != QMessageBox.StandardButton.Yes:
@@ -535,7 +585,9 @@ class MainWindow(QMainWindow):
             create_maps=self.create_maps_cb.isChecked(),
             move_unused=self.move_unused_cb.isChecked(),
             copy_mode=self.copy_mode_cb.isChecked(),
-            delete_duplicates=self.delete_duplicates_cb.isChecked()
+            delete_duplicates=self.delete_duplicates_cb.isChecked(),
+            enable_backup=self.backup_cb.isChecked(),
+            check_integrity=self.check_integrity_cb.isChecked()
         )
         
         self.organizer_thread.progress.connect(self.log)
@@ -567,12 +619,44 @@ class MainWindow(QMainWindow):
             for op in result.failed_moves[:10]:
                 self.log(f"   • {op.source.name}: {op.error}")
         
+        # Показываем ошибки целостности
+        if result.integrity_errors:
+            self.log("\n⚠️ ОШИБКИ ЦЕЛОСТНОСТИ:")
+            for error_info in result.integrity_errors[:10]:
+                self.log(f"   • {Path(error_info['file']).name}: {error_info['error']}")
+            if len(result.integrity_errors) > 10:
+                self.log(f"   ... и ещё {len(result.integrity_errors) - 10}")
+        
+        # Информация о резервной копии
+        if result.backup_id:
+            self.log(f"\n💾 Резервная копия создана (ID: {result.backup_id[:8]}...)")
+            self.log(f"   Резервная копия хранится 7 дней во временной папке")
+        
         self.log("=" * 60)
         
-        QMessageBox.information(
-            self, "Готово",
-            f"Организация завершена!\n\nУспешно: {len(result.successful_moves)}\nОшибок: {len(result.failed_moves)}"
+        msg = f"Организация завершена!\n\n"
+        msg += f"Успешно: {len(result.successful_moves)}\n"
+        msg += f"Ошибок: {len(result.failed_moves)}\n"
+        if result.integrity_errors:
+            msg += f"⚠️ Поврежденных файлов: {len(result.integrity_errors)}\n"
+        if result.backup_id:
+            msg += f"\n💾 Резервная копия создана"
+        
+        QMessageBox.information(self, "Готово", msg)
+        
+        # Сохраняем результат для отмены
+        self.last_organize_result = result
+        
+        # Создаем менеджер для отмены (с той же историей)
+        self.file_manager = FileManager(
+            enable_backup=self.backup_cb.isChecked(),
+            check_integrity=self.check_integrity_cb.isChecked()
         )
+        
+        # Если была резервная копия, создаем BackupManager для восстановления
+        if result.backup_id:
+            from core.backup_manager import BackupManager
+            self.file_manager.backup_manager = BackupManager(Path(result.maps_folder).parent if result.maps_folder else self.current_analysis.folder_path)
     
     def save_report(self):
         if not self.current_analysis:
@@ -635,6 +719,29 @@ class MainWindow(QMainWindow):
                 self.max_path_edit.setText(path)
                 self.settings.setValue("max_path", path)
                 break
+    
+    def show_restore_menu(self):
+        """Показывает меню восстановления папок"""
+        if not self.file_manager:
+            # Создаем временный FileManager для доступа к истории
+            self.file_manager = FileManager()
+        
+        # Создаем диалог с виджетом восстановления
+        dialog = QDialog(self)
+        dialog.setWindowTitle("↩️ Восстановление папок")
+        dialog.setMinimumSize(600, 500)
+        
+        layout = QVBoxLayout(dialog)
+        
+        restore_widget = RestoreMenuWidget(self.file_manager.operation_history)
+        layout.addWidget(restore_widget)
+        
+        # Кнопки диалога
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        button_box.rejected.connect(dialog.close)
+        layout.addWidget(button_box)
+        
+        dialog.exec()
     
     def closeEvent(self, event):
         self.settings.setValue("max_path", self.max_path_edit.text())

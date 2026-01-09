@@ -14,13 +14,15 @@ from PyQt6.QtWidgets import (
     QFrame, QListWidget, QListWidgetItem
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
-from PyQt6.QtGui import QFont, QTextCursor
+from PyQt6.QtGui import QFont, QTextCursor, QColor, QBrush
 
 # Добавляем путь к core
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core import AssetAnalyzer, FileManager, AnalysisResult, OrganizeResult
 from core.asset_analyzer import FileInfo
+from ui.statistics_widget import StatisticsWidget
+from ui.folder_tree_widget import FolderTreeWidget
 
 
 class AnalyzerThread(QThread):
@@ -77,12 +79,11 @@ class OrganizerThread(QThread):
     def run(self):
         result = None
         try:
-            from core.file_manager import FileManager, OrganizeResult
-            
+            # Используем импорты из начала файла
             def safe_progress(msg):
                 try:
                     self.progress.emit(str(msg))
-                except:
+                except (RuntimeError, TypeError):
                     pass
             
             manager = FileManager(progress_callback=safe_progress)
@@ -99,12 +100,12 @@ class OrganizerThread(QThread):
             import traceback
             error_msg = f"Ошибка: {str(e)}\n{traceback.format_exc()}"
             self.error.emit(error_msg)
-            from core.file_manager import OrganizeResult
+            # Используем импорт из начала файла
             result = OrganizeResult()
         
         finally:
             if result is None:
-                from core.file_manager import OrganizeResult
+                # Используем импорт из начала файла
                 result = OrganizeResult()
             self.finished_organizing.emit(result)
 
@@ -161,6 +162,13 @@ class MainWindow(QMainWindow):
         
         folder_tab = self.create_folder_tab()
         self.tabs.addTab(folder_tab, "📁 Папка со сценами")
+        
+        # Вкладки визуализации (будут доступны после анализа)
+        self.stats_widget = StatisticsWidget()
+        self.tabs.addTab(self.stats_widget, "📊 Статистика")
+        
+        self.tree_widget = FolderTreeWidget()
+        self.tabs.addTab(self.tree_widget, "📁 Структура папок")
         
                 # === Опции ===
         options_group = QGroupBox("Опции организации")
@@ -287,11 +295,19 @@ class MainWindow(QMainWindow):
         scenes_layout = QVBoxLayout(scenes_group)
         
         self.scenes_list = QListWidget()
+        self.scenes_list.itemDoubleClicked.connect(self.on_scene_double_clicked)
         scenes_layout.addWidget(self.scenes_list)
         
         layout.addWidget(scenes_group)
         
         return tab
+    
+    def on_scene_double_clicked(self, item):
+        """Обработка двойного клика по сцене в списке"""
+        scene_path = item.data(Qt.ItemDataRole.UserRole)
+        if scene_path:
+            import os
+            os.startfile(str(scene_path))
     
     def browse_max_path(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -331,8 +347,11 @@ class MainWindow(QMainWindow):
             max_files = list(folder.glob("*.max"))
         
         for f in max_files:
-            item = QListWidgetItem(str(f.relative_to(folder)))
+            item = QListWidgetItem(f"📄 {f.relative_to(folder)}")
             item.setData(Qt.ItemDataRole.UserRole, str(f))
+            # Цветовая индикация: существующие файлы - нормальный цвет, несуществующие - серый
+            if not f.exists():
+                item.setForeground(QBrush(QColor(158, 158, 158)))
             self.scenes_list.addItem(item)
         
         self.log(f"📁 Найдено сцен: {len(max_files)}")
@@ -385,6 +404,10 @@ class MainWindow(QMainWindow):
         self.organize_btn.setEnabled(True)
         self.save_report_btn.setEnabled(True)
         
+        # Обновляем виджеты визуализации
+        self.stats_widget.update_statistics(result)
+        self.tree_widget.update_tree(result)
+        
         self.log("\n" + "=" * 60)
         self.log("📊 РЕЗУЛЬТАТЫ АНАЛИЗА")
         self.log("=" * 60)
@@ -409,12 +432,50 @@ class MainWindow(QMainWindow):
                 self.log(f"\n📁 {folder_name}/")
                 self.log(f"   Всего: {stats['total']} | ✅ Используется: {stats['used']} ({used_pct:.0f}%) | ⚠️ Не используется: {stats['unused']}")
         
+        # Статистика по размерам
+        total_size = 0
+        used_size = 0
+        unused_size = 0
+        file_count = 0
+        used_count = 0
+        
+        for file_info in result.all_files_info.values():
+            try:
+                if file_info.path.exists():
+                    size = file_info.path.stat().st_size
+                    total_size += size
+                    file_count += 1
+                    if file_info.is_used:
+                        used_size += size
+                        used_count += 1
+                    else:
+                        unused_size += size
+            except (OSError, AttributeError):
+                pass
+        
+        def format_size(size_bytes):
+            for unit in ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ']:
+                if size_bytes < 1024.0:
+                    return f"{size_bytes:.2f} {unit}"
+                size_bytes /= 1024.0
+            return f"{size_bytes:.2f} ПБ"
+        
         # Итоги
         self.log(f"\n" + "=" * 60)
         self.log(f"📋 ИТОГО:")
         self.log(f"   ✅ Связано: {len(result.linked_files)}")
         self.log(f"   ⚠️ Не используется: {len(result.unused_files)}")
         self.log(f"   ❌ Отсутствует: {len(result.missing_files)}")
+        
+        # Статистика по размерам
+        if file_count > 0:
+            used_pct = (used_size / total_size * 100) if total_size > 0 else 0
+            avg_size = total_size / file_count
+            self.log(f"\n💾 РАЗМЕРЫ ФАЙЛОВ:")
+            self.log(f"   Общий размер: {format_size(total_size)}")
+            self.log(f"   ✅ Используется: {format_size(used_size)} ({used_pct:.1f}%)")
+            self.log(f"   ⚠️ Не используется: {format_size(unused_size)}")
+            self.log(f"   Средний размер файла: {format_size(avg_size)}")
         
         # Неиспользуемые по папкам
         if result.unused_files:
@@ -428,6 +489,7 @@ class MainWindow(QMainWindow):
                     self.log(f"      ... и ещё {len(files) - 10}")
         
         self.log("\n" + "=" * 60)
+        self.log("💡 Перейдите на вкладки 'Статистика' и 'Структура папок' для детальной информации")
     
     def start_organizing(self):
         """Запускает организацию файлов"""

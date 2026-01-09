@@ -71,7 +71,7 @@ class AnalysisResult:
         for p in self.all_used_assets:
             try:
                 names.add(Path(p).name.lower())
-            except:
+            except (ValueError, OSError, AttributeError):
                 pass
         return names
     

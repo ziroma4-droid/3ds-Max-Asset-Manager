@@ -86,7 +86,7 @@ class MaxFileParser:
             assets.errors.append(f"Файл не найден: {max_file_path}")
             return assets
         
-        if not max_file_path.suffix.lower() == '.max':
+        if max_file_path.suffix.lower() != '.max':
             assets.errors.append(f"Неверный формат файла: {max_file_path}")
             return assets
         
@@ -232,7 +232,7 @@ class MaxFileParser:
                     start = i + 1
                     break
                 # Проверяем на начало пути (буква диска)
-                if i > 0 and data[i] == ord(':') and data[i-1:i].isalpha():
+                if i > 0 and data[i] == ord(':') and (65 <= data[i-1] <= 90 or 97 <= data[i-1] <= 122):
                     start = i - 1
                     break
             
@@ -263,7 +263,7 @@ class MaxFileParser:
                 
                 # Проверяем на начало пути
                 if i >= 2:
-                    prev_code = struct.unpack('<H', data[i-2:i])[0] if i >= 2 else 0
+                    prev_code = struct.unpack('<H', data[i-2:i])[0]
                     # Буква диска + двоеточие
                     if char_code == ord(':') and (65 <= prev_code <= 90 or 97 <= prev_code <= 122):
                         start = i - 2

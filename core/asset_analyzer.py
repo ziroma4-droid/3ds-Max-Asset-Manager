@@ -101,7 +101,15 @@ class AssetAnalyzer:
     }
     
     PROXY_EXTENSIONS = {
-        '.vrmesh', '.abc', '.rs', '.ass', '.bgeo', '.obj'
+        '.vrmesh',  # V-Ray proxy
+        '.vrmap',   # V-Ray proxy map
+        '.vrscene', # V-Ray scene
+        '.cgeo',    # Corona proxy
+        '.abc',     # Alembic
+        '.rs',      # Redshift proxy
+        '.ass',     # Arnold proxy
+        '.bgeo',    # Houdini geometry
+        '.obj'      # OBJ (часто используется как прокси)
     }
     
     OTHER_EXTENSIONS = {

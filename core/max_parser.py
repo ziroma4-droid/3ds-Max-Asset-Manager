@@ -65,6 +65,9 @@ class MaxFileParser:
     # Расширения прокси
     PROXY_EXTENSIONS = {
         '.vrmesh',  # V-Ray proxy
+        '.vrmap',   # V-Ray proxy map
+        '.vrscene', # V-Ray scene
+        '.cgeo',    # Corona proxy
         '.abc',     # Alembic
         '.rs',      # Redshift proxy
         '.ass',     # Arnold proxy

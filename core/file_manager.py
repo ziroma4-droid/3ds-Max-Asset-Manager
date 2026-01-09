@@ -281,6 +281,19 @@ class FileManager:
                     op = self._move_file(file_path, unused_folder, copy_instead_of_move, backup_id)
                     result.operations.append(op)
             
+            # === ШАГ 3: Удаление пустых папок ===
+            self._log(f"\n{'='*50}")
+            self._log(f"🧹 УДАЛЕНИЕ ПУСТЫХ ПАПОК")
+            self._log(f"{'='*50}")
+            # Исключаем папки maps и unused из удаления
+            exclude = []
+            if maps_folder.exists():
+                exclude.append(maps_folder)
+            if unused_folder.exists():
+                exclude.append(unused_folder)
+            empty_folders_removed = self._remove_empty_folders(base_folder, exclude_folders=exclude)
+            self._log(f"Удалено пустых папок: {empty_folders_removed}")
+            
             # === ИТОГИ ===
             self._log(f"\n{'='*50}")
             self._log(f"✅ ГОТОВО!")
@@ -289,6 +302,7 @@ class FileManager:
             self._log(f"   Пропущено: {result.files_skipped}")
             self._log(f"   Успешно: {len(result.successful_moves)}")
             self._log(f"   Ошибок: {len(result.failed_moves)}")
+            self._log(f"   Удалено пустых папок: {empty_folders_removed}")
             self._log(f"{'='*50}")
             
         except Exception as e:
@@ -498,6 +512,71 @@ class FileManager:
             counter += 1
         
         return new_path
+    
+    def _remove_empty_folders(self, base_folder: Path, exclude_folders: Optional[List[Path]] = None) -> int:
+        """
+        Удаляет пустые папки в базовой директории
+        
+        Args:
+            base_folder: Базовая папка для поиска пустых папок
+            exclude_folders: Список папок, которые не нужно удалять (например, maps, unused)
+            
+        Returns:
+            Количество удаленных папок
+        """
+        if exclude_folders is None:
+            exclude_folders = []
+        
+        # Преобразуем в абсолютные пути
+        exclude_folders = [Path(f).resolve() for f in exclude_folders]
+        base_folder = Path(base_folder).resolve()
+        
+        removed_count = 0
+        
+        try:
+            # Собираем все папки, начиная с самых глубоких
+            all_folders = []
+            for folder in base_folder.rglob('*'):
+                if folder.is_dir():
+                    # Пропускаем исключенные папки и их содержимое
+                    folder_resolved = folder.resolve()
+                    if any(excluded in folder_resolved.parents or excluded == folder_resolved 
+                          for excluded in exclude_folders):
+                        continue
+                    # Пропускаем папки maps и unused
+                    if folder.name.lower() in ['maps', 'unused']:
+                        continue
+                    all_folders.append(folder_resolved)
+            
+            # Сортируем по глубине (самые глубокие сначала)
+            all_folders.sort(key=lambda p: len(p.parts), reverse=True)
+            
+            # Удаляем пустые папки
+            for folder in all_folders:
+                try:
+                    # Проверяем, что папка существует и пуста
+                    if folder.exists() and folder.is_dir():
+                        # Проверяем, что папка действительно пуста
+                        has_files = False
+                        try:
+                            for item in folder.iterdir():
+                                has_files = True
+                                break
+                        except (OSError, PermissionError):
+                            has_files = True  # Если не можем прочитать, считаем что не пуста
+                        
+                        if not has_files:
+                            folder.rmdir()
+                            removed_count += 1
+                            self._log(f"   🗑️ Удалена пустая папка: {folder.relative_to(base_folder)}")
+                except (OSError, PermissionError) as e:
+                    # Игнорируем ошибки доступа
+                    pass
+                    
+        except Exception as e:
+            self._log(f"   ⚠️ Ошибка при удалении пустых папок: {e}")
+        
+        return removed_count
     
     def create_report(self, analysis, 
                       organize_result: Optional[OrganizeResult] = None) -> str:

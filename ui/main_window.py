@@ -209,7 +209,7 @@ class MainWindow(QMainWindow):
         # Вторая строка опций
         options_row2 = QHBoxLayout()
         self.backup_cb = QCheckBox("💾 Резервное копирование")
-        self.backup_cb.setChecked(False)  # По умолчанию отключено
+        self.backup_cb.setChecked(True)  # По умолчанию включено
         self.backup_cb.setToolTip("Создавать резервные копии файлов перед операциями (хранится 7 дней)")
         options_row2.addWidget(self.backup_cb)
         
